@@ -57,6 +57,12 @@ Legacy single-panel config is fully compatible. Appending bindings auto-migrates
 - Custom outbounds: [docs-custom-outbounds.md](docs-custom-outbounds.md)
 - DNS providers (ACME DNS-01): [docs-dns-providers.md](docs-dns-providers.md)
 
+## CI 与发布
+
+推送 `fix-dev`、向 `dev` 提交 PR 或手动运行 CI 只执行测试和构建，不发布。推送 `dev` 会更新 `dev` 镜像和开发预发布；推送 `v*` 标签会发布对应版本镜像及正式 Release，最高版本标签还会更新 `latest` 镜像。开发 Release 的 `dev` 标签指向该次构建的提交。
+
+首次正式发布前，请在仓库 Actions 设置中允许 GitHub Actions 创建和写入 Release，并确保 `GITHUB_TOKEN` 有权限写入关联的 GHCR 包；推送指向目标提交的 `v*` 标签即可触发。受保护的 `dev` 标签还需允许工作流更新，否则开发发布会失败。
+
 ## License
 
 MPL-2.0.

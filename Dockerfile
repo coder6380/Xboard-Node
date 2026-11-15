@@ -10,10 +10,15 @@ RUN go mod download
 
 COPY . .
 
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
+
 RUN CGO_ENABLED=0 go build -ldflags "-s -w \
-    -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev) \
-    -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    -tags "with_quic with_utls with_wireguard with_clash_api" \
+    -X main.version=${VERSION} \
+    -X main.commit=${COMMIT} \
+    -X main.buildTime=${BUILD_TIME}" \
+    -tags "with_quic with_utls with_wireguard with_acme with_clash_api" \
     -o xboard-node ./cmd/xboard-node
 
 # Runtime stage — sing-box & xray-core are embedded as Go libraries
