@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -74,9 +75,72 @@ type syncUserDeltaPayload struct {
 
 // syncDevicesPayload carries global device state from panel.
 type syncDevicesPayload struct {
-	Users     map[int][]string `json:"users"`
-	Timestamp int64            `json:"timestamp"`
-	NodeID    int              `json:"node_id"`
+	Users     interface{} `json:"users"`
+	Timestamp int64       `json:"timestamp"`
+	NodeID    int         `json:"node_id"`
+}
+
+// decodeDeviceUsers 解析面板发送的设备快照，兼容 PHP 稀疏索引数组。
+func decodeDeviceUsers(value interface{}) (map[int][]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if list, ok := value.([]interface{}); ok && len(list) == 0 {
+		return map[int][]string{}, nil
+	}
+	users, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("users: invalid type %T", value)
+	}
+	result := make(map[int][]string, len(users))
+	for key, value := range users {
+		id, err := strconv.Atoi(key)
+		if err != nil {
+			return nil, fmt.Errorf("invalid user ID %q", key)
+		}
+		if _, exists := result[id]; exists {
+			return nil, fmt.Errorf("duplicate user ID %q", key)
+		}
+		ips, err := decodeDeviceIPs(value)
+		if err != nil {
+			return nil, fmt.Errorf("user %q: %w", key, err)
+		}
+		result[id] = ips
+	}
+	return result, nil
+}
+
+// decodeDeviceIPs 按数值索引顺序解析设备 IP 列表。
+func decodeDeviceIPs(value interface{}) ([]string, error) {
+	var items []interface{}
+	switch list := value.(type) {
+	case []interface{}:
+		items = list
+	case map[string]interface{}:
+		keys := make([]int, 0, len(list))
+		for key := range list {
+			index, err := strconv.Atoi(key)
+			if err != nil || index < 0 || strconv.Itoa(index) != key {
+				return nil, fmt.Errorf("invalid device index %q", key)
+			}
+			keys = append(keys, index)
+		}
+		sort.Ints(keys)
+		for _, index := range keys {
+			items = append(items, list[strconv.Itoa(index)])
+		}
+	default:
+		return nil, fmt.Errorf("invalid device list type %T", value)
+	}
+	ips := make([]string, 0, len(items))
+	for _, item := range items {
+		ip, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid device IP type %T", item)
+		}
+		ips = append(ips, ip)
+	}
+	return ips, nil
 }
 
 // syncNodesPayload carries the updated node list for a machine.
@@ -220,13 +284,22 @@ func (w *WSClient) connect(ctx context.Context) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
+	// 认证读取也可能永久阻塞，取消时直接关闭底层连接唤醒读取。
+	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopClose()
 
 	conn.SetReadLimit(10 << 20) // 10MB max message size
 
-	// Read first message — expect auth.success or error
+	// 复用握手超时限制首次认证响应，成功读取后清除期限。
+	if err := conn.SetReadDeadline(time.Now().Add(w.cfg.HandshakeTimeout)); err != nil {
+		return fmt.Errorf("set auth read deadline: %w", err)
+	}
 	var firstMsg wsMessage
 	if err := conn.ReadJSON(&firstMsg); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear auth read deadline: %w", err)
 	}
 	nlog.Core().Debug("ws recv", "event", firstMsg.Event, "data", string(firstMsg.Data))
 
@@ -289,9 +362,8 @@ func (w *WSClient) connect(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			conn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			// 先关闭连接，再等待读取协程，避免对端不响应关闭帧导致死锁。
+			conn.Close()
 			<-done
 			return nil
 
@@ -388,14 +460,22 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	case WSEventSyncUsers:
 		nlog.Core().Debug("ws sync users event received")
+		// 只有显式数组才是有效快照，避免缺失或 null 清空现有用户。
+		var raw struct {
+			Users json.RawMessage `json:"users"`
+		}
+		var users []json.RawMessage
+		if err := json.Unmarshal(msg.Data, &raw); err != nil || json.Unmarshal(raw.Users, &users) != nil || users == nil {
+			nlog.Core().Warn("ws: users payload missing valid array")
+			return
+		}
 		var p syncUsersPayload
 		if err := decodeData(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
-		if len(p.Users) == 0 {
-			nlog.Core().Warn("ws: users payload empty")
-			return
+		if p.Users == nil {
+			p.Users = []User{}
 		}
 		event.Users = p.Users
 		event.NodeID = p.NodeID
@@ -426,7 +506,12 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 			nlog.Core().Warn("ws: cannot decode devices payload", "error", err)
 			return
 		}
-		event.DeviceUsers = p.Users
+		users, err := decodeDeviceUsers(p.Users)
+		if err != nil {
+			nlog.Core().Warn("ws: cannot decode devices payload", "error", err)
+			return
+		}
+		event.DeviceUsers = users
 		event.NodeID = p.NodeID
 
 	case WSEventSyncNodes:

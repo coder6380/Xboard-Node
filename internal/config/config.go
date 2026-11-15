@@ -19,14 +19,14 @@ import (
 )
 
 type Config struct {
-	InstanceID string `yaml:"-"`
-	Panel   PanelConfig   `yaml:"panel"`
-	Node    NodeConfig    `yaml:"node"`
-	Kernel  KernelConfig  `yaml:"kernel"`
-	Cert    CertConfig    `yaml:"cert"`
-	Log     LogConfig     `yaml:"log"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	WS      WSConfig      `yaml:"ws"`
+	InstanceID string        `yaml:"-"`
+	Panel      PanelConfig   `yaml:"panel"`
+	Node       NodeConfig    `yaml:"node"`
+	Kernel     KernelConfig  `yaml:"kernel"`
+	Cert       CertConfig    `yaml:"cert"`
+	Log        LogConfig     `yaml:"log"`
+	Runtime    RuntimeConfig `yaml:"runtime"`
+	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -151,7 +151,9 @@ type CertConfig struct {
 	CertFile string `yaml:"cert_file"`
 	KeyFile  string `yaml:"key_file"`
 	CertDir  string `yaml:"cert_dir"`
-	HTTPPort int    `yaml:"http_port"` // port for HTTP-01 challenge (default: 80)
+	// ACMEStorageDir 保存可在节点间共享的 ACME 状态；为空时使用 CertDir。
+	ACMEStorageDir string `yaml:"acme_storage_dir,omitempty"`
+	HTTPPort       int    `yaml:"http_port"` // port for HTTP-01 challenge (default: 80)
 
 	// CertMode selects the TLS certificate strategy:
 	//   ""       - auto-detect: if CertFile is set → file; if AutoTLS → http; else none
@@ -806,6 +808,9 @@ func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 		nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
 	}
 	nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+	if nodeCfg.Cert.ACMEStorageDir == "" {
+		nodeCfg.Cert.ACMEStorageDir = filepath.Join(c.Kernel.ConfigDir, "acme-shared")
+	}
 
 	return &nodeCfg
 }

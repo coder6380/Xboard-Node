@@ -95,11 +95,21 @@ func (p *MachinePanelControlPlane) Initial(
 	return bootstrap, nil
 }
 
+// ResetETags 在快照未成功应用时强制后续轮询重新获取。
+func (p *MachinePanelControlPlane) ResetETags() { p.client.ResetETags() }
+
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	configSnapshot, err := p.client.GetConfig()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
 	}
+	// 配置和用户必须作为完整快照交付；后续失败时清除两个 ETag，避免重试收到 304 而丢失数据。
+	committed := false
+	defer func() {
+		if !committed {
+			p.client.ResetETags()
+		}
+	}()
 	users, err := p.client.GetUsers()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
@@ -113,6 +123,7 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
 	}
+	committed = true
 	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
 }
 

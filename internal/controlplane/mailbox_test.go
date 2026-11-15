@@ -54,6 +54,53 @@ func TestNodeMailboxFullUsersOverwriteAndDeltaBeforeBaseline(t *testing.T) {
 	}
 }
 
+// TestNodeMailboxEmptyUserSnapshots 验证空全量快照和删除最后一名用户均可撤销用户。
+func TestNodeMailboxEmptyUserSnapshots(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		event Event
+	}{
+		{"full", Event{Type: EventSyncUsers, Users: []model.UserSpec{}}},
+		{"remove last", Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1}}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mb := NewNodeMailbox()
+			mb.SeedBaseline([]model.UserSpec{{ID: 1}}, nil)
+			mb.MarkReady()
+			mb.Apply(tt.event)
+			state := mb.DrainIfReady()
+			if !state.HasUsers || state.Users == nil || len(state.Users) != 0 || state.NeedsReconcile {
+				t.Fatalf("expected non-nil empty users snapshot, got %+v", state)
+			}
+		})
+	}
+}
+
+// TestNodeMailboxNilUserSnapshot 验证缺失用户数据不会覆盖已有快照。
+func TestNodeMailboxNilUserSnapshot(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.MarkReady()
+	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 1}}})
+	mb.Apply(Event{Type: EventSyncUsers, Users: nil})
+	state := mb.DrainIfReady()
+	if !state.HasUsers || len(state.Users) != 1 || state.Users[0].ID != 1 {
+		t.Fatalf("nil snapshot replaced users: %+v", state)
+	}
+}
+
+// TestNodeMailboxStaleRemovalPreservesReplacement 验证旧 UUID 的删除不会覆盖新基线。
+func TestNodeMailboxStaleRemovalPreservesReplacement(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "old"}}, nil)
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 1, UUID: "new"}}})
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "remove", DeltaUsers: []model.UserSpec{{ID: 1, UUID: "old"}}})
+	mb.MarkReady()
+	state := mb.DrainIfReady()
+	if !state.HasUsers || len(state.Users) != 1 || state.Users[0].UUID != "new" {
+		t.Fatalf("replacement lost: %+v", state)
+	}
+}
+
 func TestNodeMailboxDevicesLatestWins(t *testing.T) {
 	mb := NewNodeMailbox()
 	mb.Apply(Event{Type: EventSyncDevices, DeviceUsers: map[int][]string{1: {"1.1.1.1"}}})

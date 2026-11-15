@@ -36,6 +36,8 @@ type Client struct {
 	machineID  int
 	httpClient *http.Client
 
+	// etagMu 串行化请求和缓存失效，避免在失效之后写回过期 ETag。
+	etagMu     sync.Mutex
 	configETag string
 	userETag   string
 
@@ -79,6 +81,8 @@ func (c *Client) ForNode(nodeID int) *Client {
 // returns a full response instead of 304. Used by machine mode after a
 // pre-fetch to probe the transport type.
 func (c *Client) ResetConfigETag() {
+	c.etagMu.Lock()
+	defer c.etagMu.Unlock()
 	c.configETag = ""
 }
 
@@ -217,6 +221,8 @@ func (c *Client) userPath() string {
 
 // GetConfig fetches node configuration. Returns nil if not modified (304).
 func (c *Client) GetConfig() (*NodeConfig, error) {
+	c.etagMu.Lock()
+	defer c.etagMu.Unlock()
 	resp, err := c.doRequest("GET", c.configPath(), nil, c.configETag)
 	if err != nil {
 		return nil, fmt.Errorf("get config: %w", err)
@@ -255,6 +261,8 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 
 // GetUsers fetches available users. Returns nil if not modified (304).
 func (c *Client) GetUsers() ([]User, error) {
+	c.etagMu.Lock()
+	defer c.etagMu.Unlock()
 	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
 	if err != nil {
 		return nil, fmt.Errorf("get users: %w", err)
@@ -317,6 +325,8 @@ func (c *Client) PushStatus(cpu float64, mem, swap, disk [2]uint64) error {
 
 // ResetETags clears cached ETags, forcing full responses
 func (c *Client) ResetETags() {
+	c.etagMu.Lock()
+	defer c.etagMu.Unlock()
 	c.configETag = ""
 	c.userETag = ""
 }
@@ -444,6 +454,9 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.apiFailure.Add(1)
+		if requestErr, ok := err.(*url.Error); ok {
+			return nil, &url.Error{Op: requestErr.Op, URL: c.baseURL + path, Err: requestErr.Err}
+		}
 		return nil, err
 	}
 

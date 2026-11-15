@@ -68,6 +68,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			os.Exit(1)
 		}
 		mux := http.NewServeMux()
+		// /healthz 仅表示进程存活，不代表节点已就绪。
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -95,11 +96,18 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		}
 	}()
 
-	for root := initialRoot; ; {
-		ctx, cancel := context.WithCancel(context.Background())
+	// 信号监听属于进程生命周期，不能随单次重载一起结束。
+	processCtx, stopProcess := context.WithCancel(context.Background())
+	defer stopProcess()
+	signalCtx, stopSignals := context.WithCancel(context.Background())
+	defer stopSignals()
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go handleShutdownSignals(signalCtx, stopProcess, sigCh, 15*time.Second, os.Exit)
 
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	for root := initialRoot; ; {
+		ctx, cancel := context.WithCancel(processCtx)
 
 		reloadCh := make(chan *config.RootConfig, 1)
 
@@ -112,24 +120,6 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		if err != nil {
 			nlog.Core().Warn("config watcher unavailable, hot-reload disabled", "error", err)
 		}
-
-		go func() {
-			select {
-			case sig := <-sigCh:
-				nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
-				cancel()
-
-				select {
-				case sig = <-sigCh:
-					nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
-					os.Exit(1)
-				case <-time.After(15 * time.Second):
-					nlog.Core().Error("shutdown timed out after 15s, forcing exit")
-					os.Exit(2)
-				}
-			case <-ctx.Done():
-			}
-		}()
 
 		instances, err := root.NormalizeInstances()
 		if err != nil {
@@ -208,12 +198,12 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		case <-doneCh:
 		}
 
-		signal.Stop(sigCh)
+		cancel()
 		if watcher != nil {
 			watcher.Stop()
 		}
 
-		if newRoot == nil {
+		if newRoot == nil || processCtx.Err() != nil {
 			close(errCh)
 			if err := <-errCh; err != nil {
 				os.Exit(1)
@@ -231,6 +221,31 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		applyRuntimeConfig(newInstances[0].Runtime)
 		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
+	}
+}
+
+// handleShutdownSignals 在进程退出前持续处理信号和强制退出超时。
+func handleShutdownSignals(ctx context.Context, cancel context.CancelFunc, signals <-chan os.Signal, timeout time.Duration, exit func(int)) {
+	var sig os.Signal
+	select {
+	case sig = <-signals:
+	case <-ctx.Done():
+		return
+	}
+
+	// 先启动计时，再异步记录日志和取消，避免任何阻塞使保护失效。
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	go func() {
+		cancel()
+		nlog.Core().Info(fmt.Sprintf("received %v, shutting down...", sig))
+	}()
+	select {
+	case <-signals:
+		exit(1)
+	case <-timer.C:
+		exit(2)
+	case <-ctx.Done():
 	}
 }
 

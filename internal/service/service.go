@@ -54,14 +54,16 @@ type Service struct {
 	pushInterval int // seconds
 	pullInterval int // seconds
 
-	lastUserHash   string     // hash of user list for change detection
-	lastConfigHash string     // hash of full config for change detection
-	pullBackoff    apiBackoff // backoff for panel pull failures
-	pushBackoff    apiBackoff // backoff for panel push failures
+	lastUserHash       string     // hash of user list for change detection
+	kernelStateUnknown bool       // 内核操作失败后禁止用缓存哈希去重
+	lastConfigHash     string     // hash of full config for change detection
+	pullBackoff        apiBackoff // backoff for panel pull failures
+	pushBackoff        apiBackoff // backoff for panel push failures
 
-	// pushActive prevents overlapping push/pull goroutines.
-	pushActive atomic.Bool
-	pullActive atomic.Bool
+	pushMu      sync.Mutex
+	pushDone    chan struct{}
+	pushClosing bool
+	pullActive  atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -71,6 +73,7 @@ type Service struct {
 	wsCancel         context.CancelFunc             // cancels the WS client goroutine
 	wsDisconnectAt   time.Time                      // when WS last disconnected (zero if connected)
 	wsResyncPending  atomic.Bool
+	wsResyncVersion  uint64
 	machineMailbox   *controlplane.NodeMailbox
 	machineMailboxCh <-chan struct{}
 
@@ -80,11 +83,12 @@ type Service struct {
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config      *model.NodeSpec
-	users       []model.UserSpec
-	configHash  string
-	userHash    string
-	certChanged bool
+	config        *model.NodeSpec
+	users         []model.UserSpec
+	configHash    string
+	userHash      string
+	certChanged   bool
+	resyncVersion uint64
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -205,7 +209,11 @@ func (s *Service) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.pushReportSync()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			if err := s.shutdownReport(shutdownCtx); err != nil {
+				return fmt.Errorf("shutdown report: %w", err)
+			}
 			return nil
 
 		case <-trackTicker.C:
@@ -218,13 +226,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.reportDevices()
 
 		case <-pullTicker.C:
-			// When WebSocket is connected, skip REST polling entirely.
-			// Config/user updates arrive via WS push.
-			if s.wsClient != nil && s.wsClient.IsConnected() {
-				continue
-			}
-			nlog.Core().Debug("polling from API (ws not connected)")
-			s.pullViaAPIAsync(ctx)
+			s.pollTick(ctx, s.wsClient != nil && s.wsClient.IsConnected())
 
 		case result := <-s.pullResults:
 			s.applyPullResult(ctx, result)
@@ -419,6 +421,7 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 }
 
 func (s *Service) requestWSResync(ctx context.Context, reason string) {
+	s.wsResyncVersion++
 	if !s.wsResyncPending.CompareAndSwap(false, true) {
 		return
 	}
@@ -455,9 +458,8 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		} else {
 			nlog.Core().Info("ws connected")
 		}
-		// After reconnect, proactively pull once to ensure we haven't missed
-		// any updates during the disconnection window.
-		s.pullViaAPIAsync(ctx)
+		// 连接恢复时即使已有请求在途，也必须保留后续协调要求。
+		s.requestWSResync(ctx, "connected")
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
@@ -564,7 +566,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 			return
 		}
 		newHash := computeUserHash(event.Users)
-		if newHash == s.lastUserHash {
+		if newHash == s.lastUserHash && !s.kernelStateUnknown {
 			return
 		}
 		if s.nodeLog != nil {
@@ -592,6 +594,14 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	}
 }
 
+// pollTick 在 WS 连接期间仍重试尚未完成的 REST 协调。
+func (s *Service) pollTick(ctx context.Context, connected bool) {
+	if connected && !s.wsResyncPending.Load() {
+		return
+	}
+	s.pullViaAPIAsync(ctx)
+}
+
 // pullViaAPIAsync fetches config/users from the panel API in a background
 // goroutine and sends the result to pullResults for the main goroutine to apply.
 func (s *Service) pullViaAPIAsync(ctx context.Context) {
@@ -609,19 +619,27 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 	}
 
 	currentConfigHash := s.lastConfigHash
+	resyncVersion := s.wsResyncVersion
 	certChanged := s.cert.CertRenewed()
 
 	go func() {
-		defer s.pullActive.Store(false)
+		delivered := false
+		defer func() {
+			if !delivered {
+				s.invalidatePollCache()
+				s.pullActive.Store(false)
+			}
+		}()
 		snapshot, err := s.source.Poll(ctx)
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
+			s.wsResyncPending.Store(true)
 			s.pullBackoff.onFailure()
 			return
 		}
 		s.pullBackoff.onSuccess()
 
-		result := pullResult{certChanged: certChanged}
+		result := pullResult{certChanged: certChanged, resyncVersion: resyncVersion}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
@@ -636,14 +654,33 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 		select {
 		case s.pullResults <- result:
+			delivered = true
 		case <-ctx.Done():
 		}
 	}()
 }
 
+// invalidatePollCache 避免未应用的 REST 快照被 304 响应掩盖。
+func (s *Service) invalidatePollCache() {
+	s.wsResyncPending.Store(true)
+	if source, ok := s.source.(interface{ ResetETags() }); ok {
+		source.ResetETags()
+	}
+}
+
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
-	s.wsResyncPending.Store(false)
+	defer s.pullActive.Store(false)
+	// 即使单独更新部分成功，也重新获取完整快照，让后续轮询校准状态。
+	defer func() {
+		if s.lastConfigHash == "" || s.lastUserHash == "" {
+			s.invalidatePollCache()
+		}
+	}()
+	// 拉取期间出现的新丢包不能由旧请求的结果消除。
+	if result.resyncVersion == s.wsResyncVersion {
+		s.wsResyncPending.Store(false)
+	}
 	configChanged := false
 
 	if result.certChanged {
@@ -654,6 +691,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	if result.config != nil {
 		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
 			nlog.Core().Warn("runtime config validation failed", "error", err)
+			s.invalidatePollCache()
 			result.config = nil
 		} else {
 			configChanged = true
@@ -672,18 +710,26 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		}
 	}
 
+	var prevUsers []model.UserSpec
+	var prevUserHash string
+	usersPrepared := false
 	if result.users != nil {
-		usersChanged := result.userHash != s.lastUserHash
+		usersChanged := result.userHash != s.lastUserHash || s.kernelStateUnknown
 
 		if usersChanged && !configChanged {
 			s.applyUserUpdate(ctx, result.users, result.userHash)
 		} else if usersChanged {
-			s.updateUserState(result.users)
+			prevUsers, prevUserHash = s.prepareUserState(result.users)
+			usersPrepared = true
 		}
 	}
 
 	if configChanged {
 		s.applyChanges(ctx, true, false)
+		if s.lastConfigHash == "" && usersPrepared {
+			// 仅恢复服务侧缓存；失败的内核操作可能已经部分生效。
+			s.restoreUserState(prevUsers, prevUserHash)
+		}
 	}
 }
 
@@ -731,13 +777,23 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
+	if s.kernelStateUnknown {
+		// 旧实例可能仍占用端口。停止会中断现有连接；Stop 无错误返回，
+		// 无法保证资源已完全释放，因此启动失败仍须保留未知状态并重试。
+		s.kernel.Stop()
+	}
 	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
+		// 启动可能已部分改变内核，不能继续将旧快照视为实际状态。
+		s.appliedState.Config = nil
+		s.appliedState.Users = nil
+		s.kernelStateUnknown = true
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
 
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
+	s.kernelStateUnknown = false
 
 	// Initialize node logger on first successful start
 	if s.nodeLog == nil {
@@ -751,16 +807,22 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	return true
 }
 
-// ensureRunning starts the kernel if it is not running and there are users +
-// config available. Returns true if the kernel is running afterwards.
-func (s *Service) ensureRunning() bool {
-	if s.kernel.IsRunning() {
-		return true
+// startWithUsers 使用新用户启动内核，失败时恢复原有用户状态以便重试。
+func (s *Service) startWithUsers(ctx context.Context, users []model.UserSpec) {
+	if len(users) == 0 {
+		s.updateUserState(users)
+		s.kernelStateUnknown = false
+		return
 	}
-	if len(s.lastUsers) > 0 && s.lastConfig != nil {
-		return s.startKernel(s.lastConfig, s.lastUsers)
+	if s.lastConfig == nil {
+		return
 	}
-	return false
+	prevUsers, prevHash := s.prepareUserState(users)
+	s.applyRemoteOverrides(ctx, s.lastConfig)
+	if !s.startKernel(s.lastConfig, users) {
+		s.restoreUserState(prevUsers, prevHash)
+		s.invalidatePollCache()
+	}
 }
 
 // ─── User update entry points ───────────────────────────────────────────────
@@ -768,7 +830,18 @@ func (s *Service) ensureRunning() bool {
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if !s.ensureRunning() {
+	if s.kernelStateUnknown {
+		if len(users) == 0 {
+			s.kernel.Stop()
+			s.updateUserState(users)
+			s.kernelStateUnknown = false
+		} else {
+			s.startWithUsers(ctx, users)
+		}
+		return
+	}
+	if !s.kernel.IsRunning() {
+		s.startWithUsers(ctx, users)
 		return
 	}
 
@@ -778,6 +851,8 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 		nlog.Core().Warn(fmt.Sprintf("UpdateUsers failed, restarting kernel: %v", err))
 		if !s.startKernel(s.lastConfig, users) {
 			s.restoreUserState(prevUsers, prevHash)
+			// 内核可能部分更新，内存恢复不代表内核已回滚。
+			s.invalidatePollCache()
 		}
 		return
 	}
@@ -799,15 +874,24 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
+		if s.kernelStateUnknown {
+			s.applyUserUpdate(ctx, merged, "")
+			return
+		}
 
-		if !s.ensureRunning() {
+		if !s.kernel.IsRunning() {
+			s.startWithUsers(ctx, merged)
 			return
 		}
 
 		for _, delta := range deltaUsers {
 			for _, old := range s.lastUsers {
 				if old.ID == delta.ID && old.UUID != delta.UUID {
-					s.kernel.RemoveUsers([]model.UserSpec{old})
+					if _, err := s.kernel.RemoveUsers([]model.UserSpec{old}); err != nil {
+						nlog.Core().Warn("failed to remove previous user, applying full update", "user", old.ID, "error", err)
+						s.applyUserUpdate(ctx, merged, "")
+						return
+					}
 					break
 				}
 			}
@@ -818,8 +902,11 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		if err != nil {
 			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
 			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.restoreUserState(prevUsers, prevHash)
+				nlog.Core().Warn("UpdateUsers fallback failed, restarting kernel", "error", err)
+				if !s.startKernel(s.lastConfig, merged) {
+					s.restoreUserState(prevUsers, prevHash)
+					s.invalidatePollCache()
+				}
 				return
 			}
 		}
@@ -832,19 +919,40 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		if deltaUsers == nil || len(deltaUsers) == 0 {
 			return
 		}
-		filtered := subtractUsers(s.lastUsers, deltaUsers)
+		// UUID 存在时必须匹配当前用户，避免迟到的删除事件删除替换用户。
+		matched := make([]model.UserSpec, 0, len(deltaUsers))
+		for _, delta := range deltaUsers {
+			for _, user := range s.lastUsers {
+				if user.ID == delta.ID && (delta.UUID == "" || delta.UUID == user.UUID) {
+					matched = append(matched, user)
+					break
+				}
+			}
+		}
+		if len(matched) == 0 {
+			return
+		}
+		filtered := subtractUsers(s.lastUsers, matched)
+		if s.kernelStateUnknown {
+			s.applyUserUpdate(ctx, filtered, "")
+			return
+		}
 
 		if !s.kernel.IsRunning() {
+			s.startWithUsers(ctx, filtered)
 			return
 		}
 
 		prevUsers, prevHash := s.prepareUserState(filtered)
-		removed, err := s.kernel.RemoveUsers(deltaUsers)
+		removed, err := s.kernel.RemoveUsers(matched)
 		if err != nil {
 			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
 			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.restoreUserState(prevUsers, prevHash)
+				nlog.Core().Warn("UpdateUsers fallback failed, restarting kernel", "error", err)
+				if !s.startKernel(s.lastConfig, filtered) {
+					s.restoreUserState(prevUsers, prevHash)
+					s.invalidatePollCache()
+				}
 				return
 			}
 		}
@@ -913,7 +1021,17 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 	if s.lastConfig == nil || len(s.lastUsers) == 0 {
 		if len(s.lastUsers) == 0 {
 			s.kernel.Stop()
+			s.appliedState.Config = nil
 			s.appliedState.Users = nil
+			s.kernelStateUnknown = false
+		}
+		return
+	}
+
+	if s.kernelStateUnknown {
+		if !s.startKernel(s.lastConfig, s.lastUsers) {
+			s.lastConfigHash = ""
+			s.invalidatePollCache()
 		}
 		return
 	}
@@ -923,16 +1041,24 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 	if configChanged && s.kernel.IsRunning() {
 		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.TLSCert()); err != nil {
 			nlog.Core().Warn(fmt.Sprintf("reload failed, restarting: %v", err))
-			s.startKernel(s.lastConfig, s.lastUsers)
+			// 未成功应用的配置不能参与去重，否则相同配置无法重试。
+			if !s.startKernel(s.lastConfig, s.lastUsers) {
+				s.lastConfigHash = ""
+				s.invalidatePollCache()
+			}
 		} else {
 			s.appliedState.Config = s.lastConfig
 			s.appliedState.Users = s.lastUsers
+			s.kernelStateUnknown = false
 			if s.nodeLog != nil {
 				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
 			}
 		}
 	} else if !s.kernel.IsRunning() {
-		s.startKernel(s.lastConfig, s.lastUsers)
+		if !s.startKernel(s.lastConfig, s.lastUsers) {
+			s.lastConfigHash = ""
+			s.invalidatePollCache()
+		}
 	}
 }
 
@@ -959,61 +1085,93 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 	}
 }
 
-// pushReportAsync sends the report in a background goroutine so the select
-// loop is never blocked by slow HTTP. Only one push runs at a time.
+// pushReportAsync sends at most one periodic report at a time.
 func (s *Service) pushReportAsync() {
 	if !s.sink.SupportsReporting() {
 		return
 	}
-	if !s.pushActive.CompareAndSwap(false, true) {
-		nlog.Core().Debug("push already in progress, skipping")
+	s.pushMu.Lock()
+	if s.pushClosing || s.pushDone != nil {
+		s.pushMu.Unlock()
 		return
 	}
 	if s.pushBackoff.shouldSkip() {
-		nlog.Core().Debug("skipping report due to backoff")
-		s.pushActive.Store(false)
+		s.pushMu.Unlock()
 		return
 	}
-
-	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
-	online := s.tracker.CurrentOnline()
-	status := monitor.Collect()
-	metrics := s.buildMetrics(status)
-	metrics["kernel_status"] = s.kernel.IsRunning()
+	done := make(chan struct{})
+	s.pushDone = done
+	payload := s.makeReport()
+	s.pushMu.Unlock()
 
 	go func() {
-		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sendReport(payload); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
-			if len(traffic) > 0 {
-				s.tracker.RestoreTraffic(traffic)
-			}
-			if len(aliveIPs) > 0 {
-				s.tracker.RestoreAliveIPs(aliveIPs)
-			}
 			s.pushBackoff.onFailure()
-			return
+		} else {
+			s.pushBackoff.onSuccess()
 		}
-		s.pushBackoff.onSuccess()
-		nlog.ReportPushed(len(traffic), len(online))
+		s.pushMu.Lock()
+		s.pushDone = nil
+		close(done)
+		s.pushMu.Unlock()
 	}()
 }
 
-// pushReportSync is used only during shutdown to ensure final data is sent.
-func (s *Service) pushReportSync() {
-	if !s.sink.SupportsReporting() {
-		return
-	}
+func (s *Service) makeReport() controlplane.ReportPayload {
 	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
+	alive := s.tracker.FlushAliveIPs()
+	aliveCopy := make(map[int][]string, len(alive))
+	for id, ips := range alive {
+		aliveCopy[id] = append([]string(nil), ips...)
+	}
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
+	return controlplane.ReportPayload{Traffic: traffic, Alive: aliveCopy, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}
+}
 
-	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-		nlog.Core().Warn("failed to push final report", "error", err)
+func (s *Service) sendReport(payload controlplane.ReportPayload) error {
+	if err := s.sink.Report(payload); err != nil {
+		s.tracker.RestoreTraffic(payload.Traffic)
+		s.tracker.RestoreAliveIPs(payload.Alive)
+		return err
+	}
+	nlog.ReportPushed(len(payload.Traffic), len(payload.Online))
+	return nil
+}
+
+func (s *Service) shutdownReport(ctx context.Context) error {
+	s.pushMu.Lock()
+	s.pushClosing = true
+	done := s.pushDone
+	s.pushMu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for in-flight report: %w; delivery is unknown", ctx.Err())
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.trackAndEnforce(ctx)
+	if !s.sink.SupportsReporting() {
+		return nil
+	}
+	payload := s.makeReport()
+	result := make(chan error, 1)
+	go func() { result <- s.sendReport(payload) }()
+	select {
+	case err := <-result:
+		if err != nil {
+			return fmt.Errorf("final report failed; %d users' traffic restored in memory: %w", len(payload.Traffic), err)
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for final report: %w; delivery is unknown", ctx.Err())
 	}
 }
 

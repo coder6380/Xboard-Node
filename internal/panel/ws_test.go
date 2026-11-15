@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -217,6 +219,109 @@ func TestWSClient_ReconnectOnDisconnect(t *testing.T) {
 	}
 }
 
+// TestWSClient_CancelBlockedRead 验证面板不响应时取消能唤醒认证及后续读取。
+func TestWSClient_CancelBlockedRead(t *testing.T) {
+	for _, authenticated := range []bool{false, true} {
+		t.Run(strconv.FormatBool(authenticated), func(t *testing.T) {
+			ready := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				if authenticated {
+					if err := conn.WriteJSON(wsMessage{Event: "auth.success"}); err != nil {
+						return
+					}
+				}
+				close(ready)
+				<-release
+			}))
+			defer server.Close()
+			defer close(release)
+			status := make(chan struct{}, 1)
+			ws := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), "token", 1, WSClientConfig{}, nil, func(s WSStatusChange) {
+				if s.Connected {
+					status <- struct{}{}
+				}
+			}, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() { ws.Run(ctx); close(done) }()
+			<-ready
+			if authenticated {
+				select {
+				case <-status:
+				case <-time.After(time.Second):
+					t.Fatal("认证未完成")
+				}
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("取消后读取仍被阻塞")
+			}
+		})
+	}
+}
+
+// TestWSClient_AuthReadDeadline 验证认证超时及成功后读取期限被清除。
+func TestWSClient_AuthReadDeadline(t *testing.T) {
+	for _, authenticated := range []bool{false, true} {
+		t.Run(strconv.FormatBool(authenticated), func(t *testing.T) {
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				if authenticated {
+					_ = conn.WriteJSON(wsMessage{Event: "auth.success"})
+				}
+				<-release
+			}))
+			defer server.Close()
+			defer close(release)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			status := make(chan struct{}, 1)
+			client := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), "token", 1, WSClientConfig{HandshakeTimeout: 100 * time.Millisecond}, nil, func(s WSStatusChange) {
+				if s.Connected {
+					status <- struct{}{}
+				}
+			}, nil)
+			done := make(chan error, 1)
+			go func() { done <- client.connect(ctx) }()
+			if authenticated {
+				select {
+				case <-status:
+				case <-time.After(time.Second):
+					t.Fatal("认证未完成")
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("认证后读取意外超时: %v", err)
+				case <-time.After(300 * time.Millisecond):
+				}
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if !authenticated && err == nil {
+					t.Fatal("预期认证读取超时")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("认证读取未超时或取消未生效")
+			}
+		})
+	}
+}
+
 func TestWSClient_FallbackWhenNoServer(t *testing.T) {
 	ws := NewWSClient("ws://127.0.0.1:19999", "fallback-token", 1, WSClientConfig{}, func(WSEvent) {}, nil, func() map[string]interface{} { return nil })
 
@@ -228,6 +333,74 @@ func TestWSClient_FallbackWhenNoServer(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if ws.IsConnected() {
 		t.Error("expected IsConnected() = false when no server")
+	}
+}
+
+// TestWSClient_DeviceSnapshot 验证设备快照兼容不同 JSON 结构且拒绝无效数据。
+func TestWSClient_DeviceSnapshot(t *testing.T) {
+	tests := []struct {
+		name  string
+		data  string
+		want  map[int][]string
+		valid bool
+	}{
+		{"array", `{"users":{"15029":["1.2.3.4","5.6.7.8"]},"node_id":7}`, map[int][]string{15029: {"1.2.3.4", "5.6.7.8"}}, true},
+		{"sparse", `{"users":{"15029":{"10":"5.6.7.8","2":"1.2.3.4"}},"node_id":7}`, map[int][]string{15029: {"1.2.3.4", "5.6.7.8"}}, true},
+		{"empty users", `{"users":[],"node_id":7}`, map[int][]string{}, true},
+		{"empty devices", `{"users":{"15029":[]},"node_id":7}`, map[int][]string{15029: {}}, true},
+		{"invalid IP", `{"users":{"15029":[42]},"node_id":7}`, nil, false},
+		{"invalid index", `{"users":{"15029":{"01":"1.2.3.4"}},"node_id":7}`, nil, false},
+		{"invalid user", `{"users":{"x":["1.2.3.4"]},"node_id":7}`, nil, false},
+		{"nonempty users array", `{"users":[["1.2.3.4"]],"node_id":7}`, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var received []WSEvent
+			ws := NewWSClient("", "", 0, WSClientConfig{}, func(event WSEvent) {
+				received = append(received, event)
+			}, nil, nil)
+			ws.handleDataEvent(wsMessage{Event: WSEventSyncDevices, Data: json.RawMessage(tt.data)})
+			if !tt.valid {
+				if len(received) != 0 {
+					t.Fatalf("invalid payload delivered: %+v", received)
+				}
+				return
+			}
+			if len(received) != 1 || received[0].NodeID != 7 || !reflect.DeepEqual(received[0].DeviceUsers, tt.want) {
+				t.Fatalf("received = %+v, want users %v and node ID 7", received, tt.want)
+			}
+		})
+	}
+}
+
+// TestWSClient_UserSnapshots 区分有效的空快照和缺失的用户数据。
+func TestWSClient_UserSnapshots(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		data  string
+		valid bool
+	}{
+		{"empty", `{"users":[],"node_id":7}`, true},
+		{"missing", `{"node_id":7}`, false},
+		{"null", `{"users":null,"node_id":7}`, false},
+		{"invalid", `{"users":{},"node_id":7}`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var received []WSEvent
+			ws := NewWSClient("", "", 0, WSClientConfig{}, func(event WSEvent) {
+				received = append(received, event)
+			}, nil, nil)
+			ws.handleDataEvent(wsMessage{Event: WSEventSyncUsers, Data: json.RawMessage(tt.data)})
+			if !tt.valid {
+				if len(received) != 0 {
+					t.Fatalf("invalid snapshot delivered: %+v", received)
+				}
+				return
+			}
+			if len(received) != 1 || received[0].Users == nil || len(received[0].Users) != 0 || received[0].NodeID != 7 {
+				t.Fatalf("expected non-nil empty snapshot for node 7, got %+v", received)
+			}
+		})
 	}
 }
 

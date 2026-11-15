@@ -240,18 +240,25 @@ func applyUserDelta(users *[]model.UserSpec, action string, delta []model.UserSp
 			current = append(current, user)
 		}
 	case "remove":
-		removeIDs := make(map[int]struct{}, len(delta))
+		removeUsers := make(map[int][]string, len(delta))
 		for _, user := range delta {
-			removeIDs[user.ID] = struct{}{}
+			removeUsers[user.ID] = append(removeUsers[user.ID], user.UUID)
 		}
 		filtered := current[:0]
 		for _, user := range current {
-			if _, ok := removeIDs[user.ID]; ok {
-				continue
+			remove := false
+			for _, uuid := range removeUsers[user.ID] {
+				if uuid == "" || uuid == user.UUID {
+					remove = true
+					break
+				}
 			}
-			filtered = append(filtered, user)
+			if !remove {
+				filtered = append(filtered, user)
+			}
 		}
-		current = append([]model.UserSpec(nil), filtered...)
+		// 保留非 nil 空切片，让下游将删除最后一名用户识别为有效快照。
+		current = cloneUsers(filtered)
 	default:
 		return false
 	}

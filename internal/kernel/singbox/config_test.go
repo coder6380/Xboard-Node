@@ -1,9 +1,14 @@
 package singbox
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/option"
+	singJSON "github.com/sagernet/sing/common/json"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
@@ -524,6 +529,35 @@ func TestBuildConfig(t *testing.T) {
 		t.Fatalf("inbounds: got %d, want 1", len(inbounds))
 	}
 	assertMapValue(t, inbounds[0], "type", "shadowsocks")
+}
+
+// TestDirectOutboundBindInterface 验证面板配置经过转换后可被 sing-box 原生解析。
+func TestDirectOutboundBindInterface(t *testing.T) {
+	nc := &model.NodeSpec{CustomOutbounds: []model.OutboundConfig{{
+		Tag: "wg-egress", Protocol: "direct", Settings: map[string]any{"bind_interface": "wg0"},
+	}}}
+	if err := model.ValidateCustomOutboundsForKernel(nc.CustomOutbounds, "singbox", nil); err != nil {
+		t.Fatalf("validate outbound: %v", err)
+	}
+	data, err := json.Marshal(buildConfig(config.KernelConfig{LogLevel: "warn"}, nc, nil, kernel.TLSCert{}))
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	opts, err := singJSON.UnmarshalExtendedContext[option.Options](include.Context(context.Background()), data)
+	if err != nil {
+		t.Fatalf("parse native sing-box options: %v", err)
+	}
+	for _, outbound := range opts.Outbounds {
+		if outbound.Tag != "wg-egress" {
+			continue
+		}
+		direct, ok := outbound.Options.(*option.DirectOutboundOptions)
+		if !ok || direct.BindInterface != "wg0" {
+			t.Fatalf("unexpected direct outbound options: %#v", outbound.Options)
+		}
+		return
+	}
+	t.Fatal("direct outbound not found")
 }
 
 func TestBuildConfig_OutboundPriority(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -221,12 +222,18 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		return fmt.Errorf("router not available")
 	}
 
-	// Update routing rules
-	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		nlog.Core().Debug("routing reload failed", "error", err)
-	} else {
-		nlog.Core().Debug("sing-box routing reloaded")
+	// 出站管理器不会在 Reload 中更新，必须在修改路由或入站前拒绝变更。
+	if s.nodeConfig != nil {
+		oldConfig := buildConfig(s.cfg, s.nodeConfig, s.users, s.tls)
+		if !reflect.DeepEqual(oldConfig["outbounds"], cfgMap["outbounds"]) {
+			return fmt.Errorf("outbound configuration changed: restart required")
+		}
 	}
+
+	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
+		return fmt.Errorf("reload routing rules: %w", err)
+	}
+	nlog.Core().Debug("sing-box routing reloaded")
 
 	nopFactory := singLog.NewNOPFactory()
 
@@ -238,7 +245,8 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		tag := inb.Tag
 		if !configChanged {
 			if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-				var err error
+				// 只有实际调用了匹配的更新接口才可视为成功。
+				err := fmt.Errorf("inbound update interface or options mismatch: %T / %T", existing, inb.Options)
 				switch v := existing.(type) {
 				case adapter.UpdatableInbound[option.VMessUser]:
 					if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
@@ -548,7 +556,8 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 	for _, inb := range opts.Inbounds {
 		tag := inb.Tag
 		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-			var err error
+			// 未匹配接口或选项时保留错误，回退到重建入站。
+			err := fmt.Errorf("inbound update interface or options mismatch: %T / %T", existing, inb.Options)
 			switch v := existing.(type) {
 			case adapter.UpdatableInbound[option.VMessUser]:
 				if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {

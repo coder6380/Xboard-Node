@@ -122,10 +122,11 @@ func (u *userStats) aliveIPList() map[string]bool {
 //   - Close callback to decrement IP refcounts
 //   - Per-connection rate limit token accumulation (amortized WaitN)
 type ConnTracker struct {
-	usersMu sync.RWMutex
-	users   map[int]*userStats  // userID → stats
-	uuidMap map[string]int      // UUID → userID (for lookup in RoutedConnection)
-	connMap map[string]net.Conn // connID → conn (only for force-close support)
+	usersMu  sync.RWMutex
+	users    map[int]*userStats // userID → stats
+	uuidMap  map[string]int     // UUID → userID (for lookup in RoutedConnection)
+	connMap  map[string]io.Closer
+	connUUID map[string]string
 
 	idCounter atomic.Int64
 
@@ -146,7 +147,8 @@ func NewConnTracker(_ int) *ConnTracker {
 	return &ConnTracker{
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
-		connMap:       make(map[string]net.Conn),
+		connMap:       make(map[string]io.Closer),
+		connUUID:      make(map[string]string),
 		globalDevices: make(map[int]map[string]bool),
 	}
 }
@@ -236,17 +238,12 @@ func (t *ConnTracker) RoutedConnection(
 
 	connID := t.nextID()
 
-	// Store conn reference for force-close support
-	t.usersMu.Lock()
-	t.connMap[connID] = conn
-	t.usersMu.Unlock()
-
 	var lim *rate.Limiter
 	if slf := t.speedLimitFunc.Load(); slf != nil {
 		lim = (*slf)(uuid)
 	}
 
-	return &trackedConn{
+	wrapped := &trackedConn{
 		Conn:     conn,
 		tracker:  t,
 		us:       us,
@@ -256,12 +253,15 @@ func (t *ConnTracker) RoutedConnection(
 		limiter:  lim,
 		ctx:      ctx,
 	}
+	// 保存包装连接，强制关闭时同步清理设备计数。
+	t.usersMu.Lock()
+	t.connMap[connID] = wrapped
+	t.connUUID[connID] = uuid
+	t.usersMu.Unlock()
+	return wrapped
 }
 
-// RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
-// Note: UDP connections are NOT stored in connMap because connMap is typed as
-// map[string]net.Conn, but PacketConn is a different interface. Force-close
-// for UDP connections is handled directly via trackedPacketConn.Close().
+// RoutedPacketConnection 将 UDP 连接纳入用户计数、限速及主动关闭管理。
 func (t *ConnTracker) RoutedPacketConnection(
 	ctx context.Context, conn N.PacketConn,
 	metadata adapter.InboundContext,
@@ -298,7 +298,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 		lim = (*slf)(uuid)
 	}
 
-	return &trackedPacketConn{
+	wrapped := &trackedPacketConn{
 		PacketConn: conn,
 		tracker:    t,
 		us:         us,
@@ -308,6 +308,12 @@ func (t *ConnTracker) RoutedPacketConnection(
 		limiter:    lim,
 		ctx:        ctx,
 	}
+	// 记录包装连接，避免主动关闭时遗留在线设备计数。
+	t.usersMu.Lock()
+	t.connMap[connID] = wrapped
+	t.connUUID[connID] = uuid
+	t.usersMu.Unlock()
+	return wrapped
 }
 
 // checkDeviceGate rejects connections exceeding device limit.
@@ -456,10 +462,19 @@ func (t *ConnTracker) CloseByID(id string) bool {
 
 // CloseByUUID force-closes ALL connections for a given user UUID.
 func (t *ConnTracker) CloseByUUID(uuid string) int {
-	// This is a no-op for now — sing-box doesn't expose per-user connection
-	// kill easily. The kernel's RemoveUsers removes the inbound user which
-	// prevents new connections, and existing connections will fail on next I/O.
-	return 0
+	// 在锁外关闭，避免包装连接清理引用时重入同一把锁。
+	t.usersMu.RLock()
+	var conns []io.Closer
+	for id, user := range t.connUUID {
+		if user == uuid {
+			conns = append(conns, t.connMap[id])
+		}
+	}
+	t.usersMu.RUnlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+	return len(conns)
 }
 
 // ActiveCount returns the total number of active connections.
@@ -479,6 +494,7 @@ func (t *ConnTracker) ActiveCount() int {
 func (t *ConnTracker) removeConnRef(connID string) {
 	t.usersMu.Lock()
 	delete(t.connMap, connID)
+	delete(t.connUUID, connID)
 	t.usersMu.Unlock()
 }
 
@@ -791,16 +807,18 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }
 func (c *trackedPacketConn) ReaderReplaceable() bool { return true }
-func (c *trackedPacketConn) WriterReplaceable() bool { return true }
+
+// WriterReplaceable 禁止提前剥离包装，以便快速写入路径保留计数及限速回调。
+func (c *trackedPacketConn) WriterReplaceable() bool { return false }

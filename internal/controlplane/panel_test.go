@@ -39,6 +39,69 @@ func TestPanelControlPlanePollRejectsInvalidCustomOutbounds(t *testing.T) {
 	}
 }
 
+// TestPollRetriesDiscardedSnapshots 验证轮询失败后不会因缓存 ETag 而丢失快照。
+func TestPollRetriesDiscardedSnapshots(t *testing.T) {
+	for _, mode := range []string{"panel", "machine"} {
+		for _, failure := range []string{"users", "validation", "canceled"} {
+			t.Run(mode+"/"+failure, func(t *testing.T) {
+				configRequests, userRequests := 0, 0
+				mux := http.NewServeMux()
+				mux.HandleFunc("/api/v1/server/UniProxy/config", func(w http.ResponseWriter, r *http.Request) {
+					configRequests++
+					if r.Header.Get("If-None-Match") == `"config"` {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+					w.Header().Set("ETag", `"config"`)
+					if failure == "validation" && configRequests == 1 {
+						_, _ = w.Write([]byte(`{"protocol":"shadowsocks","server_port":8388,"custom_outbounds":[{"tag":"proxy","protocol":"socks","proxy_tag":"missing","settings":{"server":"2.2.2.2","server_port":1080}}]}`))
+						return
+					}
+					_, _ = w.Write([]byte(`{"protocol":"shadowsocks","server_port":8388}`))
+				})
+				mux.HandleFunc("/api/v1/server/UniProxy/user", func(w http.ResponseWriter, r *http.Request) {
+					userRequests++
+					if failure == "users" && userRequests == 1 {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					if r.Header.Get("If-None-Match") == `"users"` {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+					w.Header().Set("ETag", `"users"`)
+					_, _ = w.Write([]byte(`{"users":[{"id":1,"uuid":"11111111-1111-1111-1111-111111111111"}]}`))
+				})
+				server := httptest.NewServer(mux)
+				defer server.Close()
+				cfg := config.PanelConfig{URL: server.URL, Token: "token", NodeID: 1}
+				var poll func(context.Context) (Snapshot, error)
+				if mode == "machine" {
+					poll = NewMachinePanelControlPlane(panelapi.NewClient(cfg), config.KernelConfig{Type: "singbox"}, nil, nil).Poll
+				} else {
+					poll = NewPanelControlPlane(cfg, config.WSConfig{}, config.KernelConfig{Type: "singbox"}).Poll
+				}
+				ctx := context.Background()
+				if failure == "canceled" {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithCancel(ctx)
+					cancel()
+				}
+				if _, err := poll(ctx); err == nil {
+					t.Fatal("expected first poll to fail")
+				}
+				snapshot, err := poll(context.Background())
+				if err != nil {
+					t.Fatalf("retry failed: %v", err)
+				}
+				if snapshot.Config == nil || len(snapshot.Users) != 1 {
+					t.Fatalf("retry lost snapshot: config=%v users=%v", snapshot.Config, snapshot.Users)
+				}
+			})
+		}
+	}
+}
+
 func TestTranslateWSEventRejectsInvalidCustomOutbounds(t *testing.T) {
 	_, err := TranslateWSEvent(panelapi.WSEvent{
 		Type: panelapi.WSEventSyncConfig,

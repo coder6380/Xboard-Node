@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
+	xrayDispatcher "github.com/xtls/xray-core/app/dispatcher"
+	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/transport"
 )
@@ -185,7 +187,6 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 	}
 }
 
-
 func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	ld := newTestDispatcher()
 	email := userEmail(1)
@@ -202,6 +203,49 @@ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	}
 	if link.Writer == origWriter {
 		t.Fatal("trackLink should wrap link.Writer for lifecycle callbacks")
+	}
+}
+
+// TestLimitDispatcher_TrackLinkPreservesSizeStatWriter 验证统计类型、写入和关闭回调均被保留。
+func TestLimitDispatcher_TrackLinkPreservesSizeStatWriter(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(21)
+	ld.UpdateLimits(map[string]int{email: 21}, map[string]int{email: 1}, nil)
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("首次连接应被允许")
+	}
+	counter := &appstats.Counter{}
+	writer := &xrayDispatcher.SizeStatWriter{Counter: counter, Writer: buf.Discard}
+	reader := nopReader{}
+	link := &transport.Link{Reader: reader, Writer: writer}
+	ld.trackLink(link, email, "1.1.1.1", true)
+
+	outer, ok := link.Writer.(*xrayDispatcher.SizeStatWriter)
+	if !ok || outer != writer || outer.Counter != counter {
+		t.Fatalf("统计写入器或计数器未保留在最外层: %T", link.Writer)
+	}
+	if link.Reader != reader {
+		t.Fatal("Reader 不应被替换")
+	}
+	b := buf.New()
+	_, _ = b.WriteString("hello")
+	if err := outer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	if got := counter.Value(); got != 5 {
+		t.Fatalf("统计字节数 = %d，期望 5", got)
+	}
+	if err := outer.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if err := outer.Close(); err != nil {
+		t.Fatalf("重复关闭失败: %v", err)
+	}
+	if got := ld.connCount.Load(); got != 0 {
+		t.Fatalf("关闭后的连接数 = %d，期望 0", got)
+	}
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Fatal("关闭后设备名额应被释放")
 	}
 }
 

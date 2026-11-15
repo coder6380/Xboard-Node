@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,8 +32,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -299,8 +299,11 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	}
 	var toAdd []model.UserSpec
 	for _, u := range users {
-		if _, exists := userMap[u.ID]; !exists {
+		if old, exists := userMap[u.ID]; !exists {
 			toAdd = append(toAdd, u)
+		} else if old.UUID != u.UUID {
+			x.mu.Unlock()
+			return 0, fmt.Errorf("user %d UUID changed; use UpdateUsers", u.ID)
 		}
 		userMap[u.ID] = u // always overwrite properties
 	}
@@ -314,7 +317,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -334,19 +337,18 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
-	ctx := context.Background()
-	added := 0
+	accounts := make([]*protocol.MemoryUser, 0, len(toAdd))
 	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
+		account, err := toMemoryUser(proto, nc, u)
 		if err != nil {
-			nlog.Core().Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
-			continue
+			return 0, fmt.Errorf("build user %d: %w", u.ID, err)
 		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
-			continue
-		}
-		added++
+		accounts = append(accounts, account)
+	}
+	added, _, err := applyUserDiff(um, nil, accounts)
+	if err != nil {
+		x.Stop()
+		return added, err
 	}
 
 	// Update bookkeeping with full merged list (new users + updated properties).
@@ -372,11 +374,12 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	for _, u := range users {
 		removeSet[u.ID] = struct{}{}
 	}
-	var kept []model.UserSpec
+	var kept, toRemove []model.UserSpec
 	removed := 0
 	for _, u := range x.users {
 		if _, rm := removeSet[u.ID]; rm {
 			removed++
+			toRemove = append(toRemove, u)
 		} else {
 			kept = append(kept, u)
 		}
@@ -404,15 +407,10 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	}
 	x.mu.Unlock()
 
-	ctx := context.Background()
-	actualRemoved := 0
-	for _, u := range users {
-		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
-			continue
-		}
-		actualRemoved++
+	_, actualRemoved, err := applyUserDiff(um, toRemove, nil)
+	if err != nil {
+		x.Stop()
+		return actualRemoved, err
 	}
 
 	x.mu.Lock()
@@ -463,24 +461,21 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
-	ctx := context.Background()
-
-	// Remove first, then add (order matters for UUID changes on same ID)
-	for _, u := range toRemove {
-		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
-		}
-	}
+	accounts := make([]*protocol.MemoryUser, 0, len(toAdd))
 	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
-			continue
+		account, buildErr := toMemoryUser(proto, nc, u)
+		if buildErr != nil {
+			return 0, 0, fmt.Errorf("build user %d: %w", u.ID, buildErr)
 		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
-		}
+		accounts = append(accounts, account)
+	}
+
+	added, removed, err = applyUserDiff(um, toRemove, accounts)
+	if err != nil {
+		// The manager may have partially applied the diff; stop rather than
+		// expose an instance with an unknown user set if recovery fails.
+		x.Stop()
+		return added, removed, err
 	}
 
 	x.mu.Lock()
@@ -491,6 +486,23 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return
+}
+
+func applyUserDiff(um xrayProxy.UserManager, toRemove []model.UserSpec, accounts []*protocol.MemoryUser) (added, removed int, err error) {
+	ctx := context.Background()
+	for _, user := range toRemove {
+		if err := um.RemoveUser(ctx, userEmail(user.ID)); err != nil {
+			return added, removed, fmt.Errorf("remove user %d: %w", user.ID, err)
+		}
+		removed++
+	}
+	for _, account := range accounts {
+		if err := um.AddUser(ctx, account); err != nil {
+			return added, removed, fmt.Errorf("add user %s: %w", account.Email, err)
+		}
+		added++
+	}
+	return added, removed, nil
 }
 
 var _ kernel.Kernel = (*Xray)(nil)
@@ -627,9 +639,12 @@ func hexEncode(dst, src []byte) {
 	}
 }
 
-// ensureGeoData downloads geo databases when routes reference geoip/geosite.
+// ensureGeoData 按最终生成的路由规则检查并下载所需的 Geo 数据库。
 func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
-	needIP, needSite := kernel.NeedsGeoIP(nc.Routes), kernel.NeedsGeoSite(nc.Routes)
+	routing := buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, x.cfg.CustomRoute))
+	mergeCustomXray(M{"routing": routing}, x.cfg)
+	rules, _ := routing["rules"].([]M)
+	needIP, needSite := kernel.NeedsXrayGeoData(rules)
 	if !needIP && !needSite {
 		return
 	}

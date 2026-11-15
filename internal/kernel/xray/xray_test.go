@@ -2,13 +2,16 @@ package xray
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/model"
 	appstats "github.com/xtls/xray-core/app/stats"
+	"github.com/xtls/xray-core/common/protocol"
 	xrayCore "github.com/xtls/xray-core/core"
 	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	xraystats "github.com/xtls/xray-core/features/stats"
@@ -162,7 +165,6 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 	}
 }
 
-
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
@@ -173,7 +175,6 @@ func TestXrayCapabilities(t *testing.T) {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -189,7 +190,6 @@ func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 		t.Fatal("expected patched bandwidth feature to receive user limiter")
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -213,7 +213,6 @@ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	}
 }
 
-
 func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	inst := new(xrayCore.Instance)
 	bm := featurebandwidth.New()
@@ -228,7 +227,6 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 		t.Fatal("expected fallback limiter derived from user speed")
 	}
 }
-
 
 func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
@@ -254,6 +252,86 @@ func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	}
 	if bm.GetUserLimiter(userEmail(1)) == nil {
 		t.Fatal("expected bandwidth limiter to be refreshed for unchanged user set")
+	}
+}
+
+type fakeUserManager struct {
+	calls []string
+	fail  string
+}
+
+func (m *fakeUserManager) AddUser(_ context.Context, user *protocol.MemoryUser) error {
+	m.calls = append(m.calls, "add:"+user.Email)
+	if m.fail == "add:"+user.Email {
+		return errors.New("add failed")
+	}
+	return nil
+}
+
+func (m *fakeUserManager) RemoveUser(_ context.Context, email string) error {
+	m.calls = append(m.calls, "remove:"+email)
+	if m.fail == "remove:"+email {
+		return errors.New("remove failed")
+	}
+	return nil
+}
+
+func (*fakeUserManager) GetUser(context.Context, string) *protocol.MemoryUser { return nil }
+func (*fakeUserManager) GetUsers(context.Context) []*protocol.MemoryUser      { return nil }
+func (*fakeUserManager) GetUsersCount(context.Context) int64                  { return 0 }
+
+func TestApplyUserDiff(t *testing.T) {
+	email := userEmail(1)
+	cases := []struct {
+		name, fail     string
+		wantCalls      []string
+		added, removed int
+		wantErr        bool
+	}{
+		{"replacement", "", []string{"remove:" + email, "add:" + email}, 1, 1, false},
+		{"remove fails", "remove:" + email, []string{"remove:" + email}, 0, 0, true},
+		{"add fails after remove", "add:" + email, []string{"remove:" + email, "add:" + email}, 0, 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &fakeUserManager{fail: tc.fail}
+			added, removed, err := applyUserDiff(manager, []model.UserSpec{{ID: 1}}, []*protocol.MemoryUser{{Email: email}})
+			if (err != nil) != tc.wantErr || added != tc.added || removed != tc.removed || !reflect.DeepEqual(manager.calls, tc.wantCalls) {
+				t.Fatalf("got (%d, %d, %v), calls %v", added, removed, err, manager.calls)
+			}
+		})
+	}
+}
+
+func TestXrayAddUsersRejectsChangedUUID(t *testing.T) {
+	x := New(config.KernelConfig{Type: "xray"})
+	x.instance = new(xrayCore.Instance)
+	x.users = []model.UserSpec{{ID: 1, UUID: "old"}}
+	added, err := x.AddUsers([]model.UserSpec{{ID: 1, UUID: "new"}})
+	if err == nil || added != 0 || x.users[0].UUID != "old" {
+		t.Fatalf("AddUsers() = (%d, %v), users = %v", added, err, x.users)
+	}
+}
+
+func TestApplyUserDiffPartialFailures(t *testing.T) {
+	first, second := userEmail(1), userEmail(2)
+	cases := []struct {
+		name, fail     string
+		remove         []model.UserSpec
+		accounts       []*protocol.MemoryUser
+		added, removed int
+	}{
+		{"add partial", "add:" + second, nil, []*protocol.MemoryUser{{Email: first}, {Email: second}}, 1, 0},
+		{"remove partial", "remove:" + second, []model.UserSpec{{ID: 1}, {ID: 2}}, nil, 0, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &fakeUserManager{fail: tc.fail}
+			added, removed, err := applyUserDiff(manager, tc.remove, tc.accounts)
+			if err == nil || added != tc.added || removed != tc.removed {
+				t.Fatalf("got (%d, %d, %v), calls %v", added, removed, err, manager.calls)
+			}
+		})
 	}
 }
 

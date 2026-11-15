@@ -140,6 +140,9 @@ func (m *Manager) Reconfigure(ctx context.Context, newCfg config.CertConfig) (bo
 	if newCfg.CertDir == "" {
 		newCfg.CertDir = m.cfg.CertDir
 	}
+	if newCfg.ACMEStorageDir == "" {
+		newCfg.ACMEStorageDir = m.cfg.ACMEStorageDir
+	}
 
 	// If ACME is running and the new config materially differs (or switches
 	// away from ACME), tear down the old certmagic instance first.
@@ -191,6 +194,10 @@ func acmeFingerprint(cfg config.CertConfig) string {
 	b.WriteString(strings.TrimSpace(cfg.Email))
 	b.WriteByte('|')
 	b.WriteString(strings.TrimSpace(cfg.DNSProvider))
+	b.WriteByte('|')
+	b.WriteString(cfg.ACMEStorageDir)
+	b.WriteByte('|')
+	b.WriteString(cfg.CertDir)
 	b.WriteByte('|')
 	for _, k := range keys {
 		b.WriteString(k)
@@ -390,6 +397,15 @@ func (m *Manager) startContent() error {
 
 // ─── Mode: http / dns (ACME) ──────────────────────────────────────────────
 
+// acmeStorage 将 ACME 状态与节点各自持久化的 PEM 分开。
+func (m *Manager) acmeStorage() *certmagic.FileStorage {
+	dir := m.cfg.ACMEStorageDir
+	if dir == "" {
+		dir = m.cfg.CertDir
+	}
+	return &certmagic.FileStorage{Path: dir}
+}
+
 func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solver) error {
 	// Idempotent for unchanged config: Reconfigure already tore down stale ACME state.
 	if m.acmeStarted {
@@ -404,7 +420,7 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 		return fmt.Errorf("create cert dir: %w", err)
 	}
 
-	storage := &certmagic.FileStorage{Path: m.cfg.CertDir}
+	storage := m.acmeStorage()
 
 	var magic *certmagic.Config
 	cache := certmagic.NewCache(certmagic.CacheOptions{

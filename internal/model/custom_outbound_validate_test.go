@@ -58,6 +58,17 @@ func TestValidateCustomOutbounds(t *testing.T) {
 			outbounds: []OutboundConfig{{Tag: "proxy", Protocol: "socks", ProxyTag: "direct", Settings: map[string]any{"server": "2.2.2.2", "server_port": 1080}}},
 		},
 		{
+			name:      "singbox direct with interface",
+			outbounds: []OutboundConfig{{Tag: "wg-egress", Protocol: "direct", Settings: map[string]any{"bind_interface": "wg0"}}},
+			kernel:    "singbox",
+		},
+		{
+			name:      "direct is not an xray protocol",
+			outbounds: []OutboundConfig{{Tag: "wg-egress", Protocol: "direct", Settings: map[string]any{"bind_interface": "wg0"}}},
+			kernel:    "xray",
+			wantErr:   `custom_outbounds[0].protocol "direct" is not supported by kernel "xray"`,
+		},
+		{
 			name:      "unsupported protocol for kernel",
 			outbounds: []OutboundConfig{{Tag: "hy2", Protocol: "hysteria2", Settings: map[string]any{"server": "2.2.2.2", "server_port": 8443}}},
 			kernel:    "xray",

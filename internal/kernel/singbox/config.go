@@ -129,12 +129,99 @@ func outboundConfigToSingbox(oc model.OutboundConfig) M {
 		for k, v := range oc.Settings {
 			m[k] = v
 		}
+		if protocol := strings.ToLower(strings.TrimSpace(oc.Protocol)); protocol == "socks" || protocol == "shadowsocks" {
+			flattenOutboundServers(m)
+		}
 	}
 
 	if oc.ProxyTag != "" {
 		m["proxy_tag"] = oc.ProxyTag
 	}
 	return m
+}
+
+// flattenOutboundServers 将可无损转换的单服务器配置转换为 sing-box 原生字段。
+// 无法转换时保留 servers，让 sing-box 解析器明确报错，避免静默丢弃配置。
+func flattenOutboundServers(m M) {
+	raw, exists := m["servers"]
+	if !exists {
+		return
+	}
+	var server map[string]any
+	switch list := raw.(type) {
+	case []any:
+		if len(list) != 1 {
+			return
+		}
+		server, _ = list[0].(map[string]any)
+	case []map[string]any:
+		if len(list) != 1 {
+			return
+		}
+		server = list[0]
+	}
+	if server == nil {
+		return
+	}
+
+	converted := M{}
+	for key, value := range server {
+		target := key
+		switch key {
+		case "address":
+			target = "server"
+		case "port":
+			target = "server_port"
+		case "server", "server_port", "method", "password", "plugin", "plugin_opts", "network", "version", "username":
+		case "users":
+			users, ok := value.([]any)
+			if !ok || len(users) != 1 {
+				return
+			}
+			user, ok := users[0].(map[string]any)
+			if !ok {
+				return
+			}
+			for userKey, userValue := range user {
+				var target string
+				switch userKey {
+				case "user", "username":
+					target = "username"
+				case "pass", "password":
+					target = "password"
+				default:
+					return
+				}
+				if _, exists := converted[target]; exists {
+					return
+				}
+				converted[target] = userValue
+			}
+			continue
+		default:
+			return
+		}
+		if target == "server_port" {
+			if port, ok := value.(string); ok {
+				parsed, err := strconv.Atoi(strings.TrimSpace(port))
+				if err != nil || parsed < 1 || parsed > 65535 {
+					return
+				}
+				value = parsed
+			}
+		}
+		if _, exists := converted[target]; exists {
+			return
+		}
+		converted[target] = value
+	}
+	delete(m, "servers")
+	for key, value := range converted {
+		// 原生扁平字段优先，兼容现有面板配置。
+		if _, exists := m[key]; !exists {
+			m[key] = value
+		}
+	}
 }
 
 func mergeRouteList(a, b []map[string]any) []map[string]any {

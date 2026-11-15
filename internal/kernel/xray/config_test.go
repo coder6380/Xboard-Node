@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -322,6 +324,48 @@ func TestBuildRouting_WithRules(t *testing.T) {
 	r3 := xrayRules[3]
 	if r3["outboundTag"] != "direct" {
 		t.Errorf("expected direct, got %v", r3["outboundTag"])
+	}
+}
+
+// TestGeoDataForGeneratedRoutes 验证面板和原生自定义路由会触发正确的数据需求。
+func TestGeoDataForGeneratedRoutes(t *testing.T) {
+	tests := []struct {
+		name       string
+		panel      []model.RouteRule
+		structured []model.CustomRouteRule
+		raw        []map[string]any
+		wantIP     bool
+		wantSite   bool
+	}{
+		{name: "面板规则", panel: []model.RouteRule{{Match: []string{" geoip:cn ", "geosite:cn"}}}, wantIP: true, wantSite: true},
+		{name: "结构化规则", structured: []model.CustomRouteRule{{Match: model.RouteMatch{SourceCIDRs: []string{"geoip:private"}, Domains: []string{"geosite:cn"}}}}, wantIP: true, wantSite: true},
+		{name: "禁用规则", structured: []model.CustomRouteRule{{Disabled: true, Match: model.RouteMatch{Domains: []string{"geosite:cn"}}}}},
+		{name: "原生规则", raw: []map[string]any{{"ip": []any{"geoip:cn"}, "domain": []string{"geosite:cn"}}}, wantIP: true, wantSite: true},
+		{name: "普通规则", raw: []map[string]any{{"domain": []string{"domain:example.com"}, "outboundTag": "geoip:cn"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			routing := buildRouting(tt.panel, tt.structured, tt.raw)
+			gotIP, gotSite := kernel.NeedsXrayGeoData(routing["rules"].([]M))
+			if gotIP != tt.wantIP || gotSite != tt.wantSite {
+				t.Errorf("需求 = (%v, %v), 期望 (%v, %v)", gotIP, gotSite, tt.wantIP, tt.wantSite)
+			}
+		})
+	}
+}
+
+// TestGeoDataForCustomConfig 验证原生配置文件合并后的路由引用能够被识别。
+func TestGeoDataForCustomConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xray.json")
+	data := []byte(`{"routing":{"rules":[{"type":"field","ip":["geoip:cn"],"domain":["geosite:cn"],"outboundTag":"direct"}]}}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	routing := buildRouting(nil, nil, nil)
+	mergeCustomXray(M{"routing": routing}, config.KernelConfig{CustomConfig: path})
+	needIP, needSite := kernel.NeedsXrayGeoData(routing["rules"].([]M))
+	if !needIP || !needSite {
+		t.Errorf("需求 = (%v, %v), 期望均为 true", needIP, needSite)
 	}
 }
 

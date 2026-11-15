@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -17,6 +18,19 @@ func newTestServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
 		NodeID: 1,
 	})
 	return ts, client
+}
+
+func TestRequestErrorDoesNotExposeToken(t *testing.T) {
+	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {})
+	ts.Close()
+
+	_, err := client.GetConfig()
+	if err == nil {
+		t.Fatal("expected request error")
+	}
+	if strings.Contains(err.Error(), "test-token") {
+		t.Fatalf("request error exposes token: %v", err)
+	}
 }
 
 func TestGetConfig_Success(t *testing.T) {
