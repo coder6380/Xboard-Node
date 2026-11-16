@@ -1,7 +1,7 @@
 # Build stage
 FROM golang:1.26-alpine AS builder
 
-RUN apk add --no-cache git
+RUN apk add --no-cache git upx
 
 WORKDIR /build
 
@@ -18,8 +18,11 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w \
     -X main.version=${VERSION} \
     -X main.commit=${COMMIT} \
     -X main.buildTime=${BUILD_TIME}" \
-    -tags "with_quic with_utls with_wireguard with_acme with_clash_api" \
-    -o xboard-node ./cmd/xboard-node
+    -tags "with_grpc with_quic with_utls with_wireguard with_acme with_clash_api" \
+    -o xboard-node ./cmd/xboard-node \
+    && upx --best xboard-node \
+    && upx -t xboard-node \
+    && ./xboard-node -v
 
 # Runtime stage — sing-box & xray-core are embedded as Go libraries
 FROM alpine:3.20
