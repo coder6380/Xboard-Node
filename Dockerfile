@@ -20,7 +20,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w \
     -X main.buildTime=${BUILD_TIME}" \
     -tags "with_grpc with_quic with_utls with_wireguard with_acme with_clash_api" \
     -o xboard-node ./cmd/xboard-node \
-    && upx --best xboard-node \
+    && upx xboard-node \
     && upx -t xboard-node \
     && ./xboard-node -v
 

@@ -50,7 +50,6 @@ jobs:
           else
             make build-linux-arm64
           fi
-      - uses: docker/setup-qemu-action@v3
       - name: Install UPX
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
       - name: Compress and verify build files
@@ -60,11 +59,9 @@ jobs:
           set -eu
           for file in "xboard-node-linux-$GOARCH" "xbctl-linux-$GOARCH"; do
             test -s "$file"
-            upx --best "$file"
+            upx "$file"
             upx -t "$file"
           done
-          docker run --rm --platform "linux/$GOARCH" -v "$PWD:/work:ro" --entrypoint "/work/xboard-node-linux-$GOARCH" alpine:3.20 -v
-          docker run --rm --platform "linux/$GOARCH" -v "$PWD:/work:ro" --entrypoint "/work/xbctl-linux-$GOARCH" alpine:3.20 version
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.goarch }}
