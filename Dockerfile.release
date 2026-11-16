@@ -1,0 +1,15 @@
+FROM alpine:3.20
+
+ARG TARGETARCH
+
+RUN apk add --no-cache ca-certificates tzdata
+
+# 使用 CI 已编译并压缩的目标架构二进制。
+COPY --chmod=755 dist/xboard-node-linux-${TARGETARCH} /usr/local/bin/xboard-node
+
+RUN mkdir -p /etc/xboard-node
+
+WORKDIR /etc/xboard-node
+
+ENTRYPOINT ["xboard-node"]
+CMD ["-c", "/etc/xboard-node/config.yml"]
