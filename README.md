@@ -22,7 +22,15 @@ docker run -d --restart=always --network=host \
   ghcr.io/coder6380/xboard-node:latest
 ```
 
-### Installer (Linux systemd)
+### Installer (Linux systemd / OpenRC)
+
+Alpine Linux 使用 OpenRC。以 root 登录并先安装 Bash 和 curl，确保系统已启动 OpenRC（容器通常没有运行 init）：
+
+```bash
+apk add --no-cache bash curl ca-certificates
+```
+
+然后以 root 执行下方安装命令（去掉 `sudo`）。OpenRC 服务日志保存在 `/var/log/xboard-node.log`，可使用 `xbctl service logs` 查看；日志不会自动轮转，请配置系统日志轮转。OpenRC 日志命令支持 `-f`、`--follow`、`-n 数量` 和 `--lines 数量`，其他 journalctl 参数不支持。脚本下载最新发布版本的二进制；只有发布包含 OpenRC 支持的版本后才能直接使用。
 
 ```bash
 # Node mode

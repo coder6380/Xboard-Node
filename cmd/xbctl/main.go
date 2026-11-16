@@ -154,6 +154,8 @@ func run(args []string) error {
 		return nil
 	}
 	switch args[0] {
+	case "start-managed":
+		return startManagedProcess()
 	case "status":
 		return runStatus()
 	case "list":
@@ -294,17 +296,9 @@ func runService(args []string) error {
 		return errors.New("usage: xbctl service <status|start|stop|restart|enable|disable|logs>")
 	}
 	sub := args[0]
-	rest := args[1:]
 	switch sub {
-	case "status":
-		return runCommand("sudo", append([]string{"systemctl", "status", serviceName, "--no-pager"}, rest...)...)
-	case "start", "stop", "restart", "enable", "disable":
-		return runCommand("sudo", append([]string{"systemctl", sub, serviceName}, rest...)...)
-	case "logs":
-		if len(rest) == 0 {
-			rest = []string{"-f"}
-		}
-		return runCommand("sudo", append([]string{"journalctl", "-u", serviceName}, rest...)...)
+	case "status", "start", "stop", "restart", "enable", "disable", "logs":
+		return manageService(sub, args[1:]...)
 	default:
 		return fmt.Errorf("unknown service command: %s", sub)
 	}
@@ -374,7 +368,7 @@ func runBindAdd(mode string, args []string) error {
 	}
 	// Restart service to pick up new config
 	fmt.Println("Restarting service...")
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	if err := manageService("restart"); err != nil {
 		return fmt.Errorf("service restart failed: %w", err)
 	}
 	fmt.Println("Binding added successfully")
@@ -468,8 +462,8 @@ func runUpgrade(args []string) error {
 
 	// Restart service
 	fmt.Println("Restarting service...")
-	runCommand("systemctl", "daemon-reload")
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	manageService("reload")
+	if err := manageService("restart"); err != nil {
 		fmt.Println("Restart failed, rolling back...")
 		rollbackOK := true
 		if fileExists(backupBinary) {
@@ -484,8 +478,8 @@ func runUpgrade(args []string) error {
 				rollbackOK = false
 			}
 		}
-		runCommand("systemctl", "daemon-reload")
-		if e := runCommand("systemctl", "restart", serviceName); e != nil {
+		manageService("reload")
+		if e := manageService("restart"); e != nil {
 			return fmt.Errorf("upgrade and rollback restart both failed: %w", e)
 		}
 		if rollbackOK {
@@ -541,17 +535,21 @@ func runUninstall(args []string) error {
 	var warnings []string
 
 	// Stop and disable service
-	if fileExists(serviceFilePath) {
-		if err := runCommand("systemctl", "stop", serviceName); err != nil {
+	path := serviceFilePath
+	if backend, err := serviceBackend(); err == nil && backend == "openrc" {
+		path = openRCPath
+	}
+	if fileExists(path) {
+		if err := manageService("stop"); err != nil {
 			warnings = append(warnings, fmt.Sprintf("stop service: %v", err))
 		}
-		if err := runCommand("systemctl", "disable", serviceName); err != nil {
+		if err := manageService("disable"); err != nil {
 			warnings = append(warnings, fmt.Sprintf("disable service: %v", err))
 		}
-		if err := os.Remove(serviceFilePath); err != nil {
+		if err := os.Remove(path); err != nil {
 			warnings = append(warnings, fmt.Sprintf("remove service file: %v", err))
 		}
-		runCommand("systemctl", "daemon-reload")
+		manageService("reload")
 	}
 
 	// Remove binaries
@@ -782,7 +780,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
 			return err
 		}
-		runCommand("systemctl", "stop", serviceName)
+		manageService("stop")
 		fmt.Printf("removed %d binding(s)\n", len(removed))
 		fmt.Println("All bindings removed. Service stopped.")
 		fmt.Println("Use 'xbctl bind add-node/add-machine' to add a new binding, or 'xbctl uninstall' to fully uninstall.")
@@ -800,7 +798,7 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
 		return err
 	}
-	if err := runCommand("systemctl", "restart", serviceName); err != nil {
+	if err := manageService("restart"); err != nil {
 		return err
 	}
 	fmt.Printf("removed %d binding(s)\n", len(removed))
@@ -1069,6 +1067,16 @@ func printRows(rows []instanceRow, output string) error {
 }
 
 func systemctlState() string {
+	backend, err := serviceBackend()
+	if err != nil {
+		return "unknown"
+	}
+	if backend == "openrc" {
+		if exec.Command("rc-service", openRCName, "status").Run() == nil {
+			return "active"
+		}
+		return "inactive"
+	}
 	cmd := exec.Command("systemctl", "is-active", serviceName)
 	out, err := cmd.CombinedOutput()
 	state := strings.TrimSpace(string(out))
@@ -1307,6 +1315,10 @@ func runConfigInit(args []string) error {
 		}
 	}
 
+	// 在写入任何文件前校验凭据，避免绑定失败后配置已经改变。
+	if strings.ContainsAny(token, "\r\n\x00") {
+		return errors.New("credential value contains a newline or NUL")
+	}
 	if mode == "" {
 		return errors.New("--mode is required (node or machine)")
 	}
@@ -1450,6 +1462,9 @@ func runConfigInit(args []string) error {
 // mergeCredentials reads existing key=value credentials, adds/replaces
 // the given key, and writes the result preserving insertion order.
 func mergeCredentials(srcPath, dstPath, key, value string) error {
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return errors.New("credential value contains a newline or NUL")
+	}
 	entries := make(map[string]string)
 	var order []string
 	if srcPath != "" {
@@ -1526,9 +1541,7 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 	return os.WriteFile(path, data, 0o644)
 }
 
-// runConfigHealthPort reads health_port from an existing config file and
-// prints it to stdout. Exits silently if the file does not exist or has
-// no health_port.
+// runConfigHealthPort 输出主程序实际使用的第一个实例或旧版配置的健康端口。
 func runConfigHealthPort(args []string) error {
 	cfgPath := defaultConfigPath
 	for i := 0; i < len(args); i++ {
@@ -1545,16 +1558,10 @@ func runConfigHealthPort(args []string) error {
 	if err := yaml.Unmarshal(data, root); err != nil {
 		return nil
 	}
-	// Check instances first, then legacy top-level.
+	// 主程序只为第一个实例启动健康检查，顶层端口不向实例继承。
 	if len(root.Instances) > 0 {
-		for _, inst := range root.Instances {
-			if inst.HealthPort > 0 {
-				fmt.Println(inst.HealthPort)
-				return nil
-			}
-		}
-	}
-	if root.Config.HealthPort > 0 {
+		fmt.Println(root.Instances[0].HealthPort)
+	} else {
 		fmt.Println(root.Config.HealthPort)
 	}
 	return nil

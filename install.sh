@@ -17,6 +17,8 @@ CREDENTIALS_FILE="${INSTALL_ROOT}/credentials.env"
 BINARY_PATH="/usr/local/bin/xboard-node"
 SERVICE_NAME="xboard-node.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+INIT_BACKEND=""
+SERVICE_MODE=644
 CLI_PATH="/usr/local/bin/xbctl"
 INSTALLER_COPY_PATH="${INSTALL_ROOT}/install.sh"
 CLI_BINARY_SOURCE=""
@@ -77,10 +79,18 @@ load_health_port_from_config() {
         return
     fi
     local parsed
-    if [ -x "$CLI_PATH" ]; then
-        parsed=$("$CLI_PATH" config health-port --config "$cfg_path" 2>/dev/null)
+    # 升级及回滚时优先使用新版本解析器，旧版不会输出禁用的零端口。
+    if [ -n "$TMP_DIR" ] && [ -x "$TMP_DIR/xbctl" ]; then
+        parsed=$("$TMP_DIR/xbctl" config health-port --config "$cfg_path" 2>/dev/null) || return 1
+    elif [ -x "$CLI_PATH" ]; then
+        parsed=$("$CLI_PATH" config health-port --config "$cfg_path" 2>/dev/null) || return 1
     else
-        parsed=$(grep -m1 'health_port:' "$cfg_path" 2>/dev/null | sed 's/.*health_port:[[:space:]]*//' | tr -cd '0-9')
+        log_error "Cannot read health port without xbctl"
+        return 1
+    fi
+    if [ -z "$parsed" ]; then
+        log_error "Cannot determine the configured health port"
+        return 1
     fi
     if [ -n "$parsed" ] && [ "$parsed" -ge 0 ] 2>/dev/null; then
         HEALTH_PORT="$parsed"
@@ -121,7 +131,7 @@ rollback_install() {
             rm -f "$CLI_PATH"
         fi
         if [ -f "$BACKUP_PATH/${SERVICE_NAME}" ]; then
-            install -m 644 "$BACKUP_PATH/${SERVICE_NAME}" "$SERVICE_PATH"
+            install -m "$SERVICE_MODE" "$BACKUP_PATH/${SERVICE_NAME}" "$SERVICE_PATH"
         else
             rm -f "$SERVICE_PATH"
         fi
@@ -347,14 +357,38 @@ detect_os() {
 }
 
 ensure_systemd() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_error "systemd is required for this installer"
+    if [ -d /run/systemd/system ] && type -P systemctl >/dev/null 2>&1; then
+        INIT_BACKEND=systemd
+        SERVICE_MODE=644
+    elif [ -f /run/openrc/softlevel ] && command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 && command -v supervise-daemon >/dev/null 2>&1 && rc-status --runlevel >/dev/null 2>&1; then
+        INIT_BACKEND=openrc
+        SERVICE_NAME=xboard-node
+        SERVICE_PATH=/etc/init.d/xboard-node
+        SERVICE_MODE=755
+    else
+        log_error "A running systemd or OpenRC with supervise-daemon is required"
         exit 1
     fi
-    if [ ! -d /run/systemd/system ]; then
-        log_error "This host does not appear to be running systemd"
-        exit 1
+}
+
+# 统一安装器服务操作，避免将凭据交给 shell 解释。
+systemctl() {
+    if [ "$INIT_BACKEND" = systemd ]; then
+        command systemctl "$@"
+        return
     fi
+    local action="$1"
+    shift
+    case "$action" in
+        daemon-reload|reset-failed) return 0 ;;
+        enable) rc-update add "$SERVICE_NAME" default ;;
+        disable) rc-update del "$SERVICE_NAME" default ;;
+        is-enabled) rc-update show default | grep -q "^[[:space:]]*${SERVICE_NAME}[[:space:]]" ;;
+        is-active) rc-service "$SERVICE_NAME" status >/dev/null 2>&1 ;;
+        status) rc-service "$SERVICE_NAME" status ;;
+        start|stop|restart) rc-service "$SERVICE_NAME" "$action" ;;
+        *) log_error "Unsupported service action: $action"; return 1 ;;
+    esac
 }
 
 run_with_retry() {
@@ -377,6 +411,9 @@ run_with_retry() {
 
 install_dependencies() {
     case "$OS" in
+        alpine)
+            run_with_retry 5 3 apk add --no-cache bash curl wget ca-certificates >/dev/null
+            ;;
         ubuntu|debian)
             DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq
             DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates >/dev/null 2>&1
@@ -589,6 +626,33 @@ render_config() {
 }
 
 render_service() {
+    if [ "$INIT_BACKEND" = openrc ]; then
+        cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_OPENRC
+#!/sbin/openrc-run
+name="Xboard Node Backend"
+supervisor=supervise-daemon
+command="${CLI_PATH}"
+command_args="start-managed"
+command_chdir="${INSTALL_ROOT}"
+rc_ulimit="-n 1048576"
+command_background=false
+output_log="/var/log/xboard-node.log"
+error_log="/var/log/xboard-node.log"
+respawn_delay=5
+respawn_max=0
+
+depend() {
+    need net
+}
+
+start_pre() {
+    cd "${INSTALL_ROOT}" || return 1
+    touch /var/log/xboard-node.log || return 1
+    chmod 600 /var/log/xboard-node.log
+}
+EOF_OPENRC
+        return
+    fi
     cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
 [Unit]
 Description=Xboard Node Backend
@@ -656,7 +720,7 @@ install_staged_files() {
     fi
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
-    install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    install -m "$SERVICE_MODE" "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
 }
@@ -684,7 +748,9 @@ wait_for_health() {
 }
 
 show_recent_logs() {
-    if command -v journalctl >/dev/null 2>&1; then
+    if [ "$INIT_BACKEND" = openrc ]; then
+        [ ! -f /var/log/xboard-node.log ] || tail -n 30 /var/log/xboard-node.log
+    elif command -v journalctl >/dev/null 2>&1; then
         journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
     fi
 }
@@ -739,10 +805,11 @@ perform_upgrade() {
     stage_xbctl
     render_service
     backup_existing_state
+    load_health_port_from_config "$CONFIG_FILE"
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
-    install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    install -m "$SERVICE_MODE" "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
     systemctl restart "$SERVICE_NAME"
     if ! wait_for_health; then
