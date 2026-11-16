@@ -26,11 +26,11 @@ docker run -d --restart=always --network=host \
 
 ```bash
 # Node mode
-curl -fsSL https://raw.githubusercontent.com/coder6380/Xboard-Node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/coder6380/Xboard-Node/fix-dev/install.sh | \
   sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1
 
 # Machine mode
-curl -fsSL https://raw.githubusercontent.com/coder6380/Xboard-Node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/coder6380/Xboard-Node/fix-dev/install.sh | \
   sudo bash -s -- --mode machine --panel https://panel.example.com --token TOKEN --machine-id 1
 ```
 
