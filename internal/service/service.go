@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -57,6 +56,8 @@ type Service struct {
 	lastUserHash       string     // hash of user list for change detection
 	kernelStateUnknown bool       // 内核操作失败后禁止用缓存哈希去重
 	lastConfigHash     string     // hash of full config for change detection
+	certReloadPending  bool       // true when renewed cert still needs kernel reload
+	stateVersion       uint64     // monotonic version incremented on WS config/user mutations
 	pullBackoff        apiBackoff // backoff for panel pull failures
 	pushBackoff        apiBackoff // backoff for panel push failures
 
@@ -66,6 +67,9 @@ type Service struct {
 	pullActive  atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
+
+	discoveryActive  atomic.Bool
+	discoveryResults chan discoveryResult
 
 	wsClient         controlplane.PushClient        // Push client (nil if push is not enabled)
 	wsEvents         chan controlplane.Event        // receives data events from push transport
@@ -87,13 +91,19 @@ type pullResult struct {
 	users         []model.UserSpec
 	configHash    string
 	userHash      string
-	certChanged   bool
 	resyncVersion uint64
+	stateVersion  uint64
 }
 
-// apiBackoff implements simple exponential backoff for API failures.
+type discoveryResult struct {
+	pushClient controlplane.PushClient
+	err        error
+}
+
+// apiBackoff implements simple exponential backoff for API failures (1→2→4→8 ticks).
 type apiBackoff struct {
 	mu            sync.Mutex
+	level         int
 	skipRemaining int
 }
 
@@ -109,6 +119,7 @@ func (b *apiBackoff) shouldSkip() bool {
 
 func (b *apiBackoff) onSuccess() {
 	b.mu.Lock()
+	b.level = 0
 	b.skipRemaining = 0
 	b.mu.Unlock()
 }
@@ -116,11 +127,12 @@ func (b *apiBackoff) onSuccess() {
 func (b *apiBackoff) onFailure() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.skipRemaining <= 0 {
-		b.skipRemaining = 1
-	} else if b.skipRemaining < 8 {
-		b.skipRemaining *= 2
+	if b.level <= 0 {
+		b.level = 1
+	} else if b.level < 8 {
+		b.level *= 2
 	}
+	b.skipRemaining = b.level
 }
 
 func New(cfg *config.Config) *Service {
@@ -144,10 +156,10 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	certMgr := cert.NewManager(cfg.Cert)
 
 	var k kernel.Kernel
-	switch cfg.Kernel.Type {
-	case "singbox":
+	switch strings.ToLower(strings.TrimSpace(cfg.Kernel.Type)) {
+	case "singbox", "sing-box":
 		k = singbox.New(cfg.Kernel)
-	case "xray":
+	case "xray", "xray-core":
 		k = xray.New(cfg.Kernel)
 	default:
 		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
@@ -156,19 +168,22 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
+	tr := tracker.New()
+	tr.SetTrackInterval(cfg.Node.TrackInterval)
 
 	return &Service{
-		cfg:          cfg,
-		source:       cp,
-		sink:         cp,
-		kernel:       k,
-		tracker:      tracker.New(),
-		limiter:      l,
-		speedTracker: st,
-		cert:         certMgr,
-		wsEvents:     make(chan controlplane.Event, 16),
-		wsStatusCh:   make(chan controlplane.StatusChange, 4),
-		pullResults:  make(chan pullResult, 1),
+		cfg:              cfg,
+		source:           cp,
+		sink:             cp,
+		kernel:           k,
+		tracker:          tr,
+		limiter:          l,
+		speedTracker:     st,
+		cert:             certMgr,
+		wsEvents:         make(chan controlplane.Event, 16),
+		wsStatusCh:       make(chan controlplane.StatusChange, 64),
+		pullResults:      make(chan pullResult, 1),
+		discoveryResults: make(chan discoveryResult, 1),
 	}
 }
 
@@ -185,18 +200,39 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	defer s.kernel.Stop()
 
-	// Set up tickers
-	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
-	pushInterval := time.Duration(math.Max(float64(s.pushInterval), 5)) * time.Second
-	pullInterval := time.Duration(s.pullInterval) * time.Second
-	reportTicker := time.NewTicker(pushInterval)
-	pullTicker := time.NewTicker(pullInterval)
-	deviceReportTicker := time.NewTicker(time.Duration(s.cfg.Node.DeviceReportInterval) * time.Second)
+	// Set up tickers with positive floors to avoid panicking on invalid or zero intervals.
+	trackSec := s.cfg.Node.TrackInterval
+	if trackSec < 10 {
+		trackSec = 10
+	}
+	trackTicker := time.NewTicker(time.Duration(trackSec) * time.Second)
+
+	pushSec := s.pushInterval
+	if pushSec < 5 {
+		pushSec = 5
+	}
+	reportTicker := time.NewTicker(time.Duration(pushSec) * time.Second)
+
+	pullSec := s.pullInterval
+	if pullSec < 10 {
+		pullSec = 60
+	}
+	pullTicker := time.NewTicker(time.Duration(pullSec) * time.Second)
+
+	devReportSec := s.cfg.Node.DeviceReportInterval
+	if devReportSec < 10 {
+		devReportSec = 30
+	}
+	deviceReportTicker := time.NewTicker(time.Duration(devReportSec) * time.Second)
 
 	// WS discovery: when in REST-only mode, periodically re-handshake to check
 	// if WS has been enabled. When WS is disconnected for too long, re-check
 	// if it's still available.
-	wsDiscoveryTicker := time.NewTicker(time.Duration(s.cfg.WS.DiscoveryInterval) * time.Second)
+	discoverySec := s.cfg.WS.DiscoveryInterval
+	if discoverySec < 30 {
+		discoverySec = 300
+	}
+	wsDiscoveryTicker := time.NewTicker(time.Duration(discoverySec) * time.Second)
 
 	defer trackTicker.Stop()
 	defer reportTicker.Stop()
@@ -218,6 +254,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 		case <-trackTicker.C:
 			s.trackAndEnforce(ctx)
+			s.checkCertRenewal(ctx)
 
 		case <-reportTicker.C:
 			s.pushReportAsync()
@@ -226,13 +263,17 @@ func (s *Service) Run(ctx context.Context) error {
 			s.reportDevices()
 
 		case <-pullTicker.C:
+			s.checkCertRenewal(ctx)
 			s.pollTick(ctx, s.wsClient != nil && s.wsClient.IsConnected())
 
 		case result := <-s.pullResults:
 			s.applyPullResult(ctx, result)
 
 		case <-wsDiscoveryTicker.C:
-			s.wsDiscovery(ctx)
+			s.wsDiscoveryAsync(ctx)
+
+		case disc := <-s.discoveryResults:
+			s.applyDiscoveryResult(ctx, disc)
 
 		case status := <-s.wsStatusCh:
 			s.handleWSStatus(ctx, status)
@@ -312,7 +353,10 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		return nil
 	}
 
-	s.applyRemoteOverrides(ctx, bootstrap.Config)
+	if _, err := s.applyRemoteOverrides(ctx, bootstrap.Config); err != nil {
+		nlog.Core().Warn("initial remote overrides failed, will retry", "error", err)
+		s.lastConfigHash = ""
+	}
 	if !s.startKernel(bootstrap.Config, bootstrap.Users) {
 		return fmt.Errorf("start kernel")
 	}
@@ -321,16 +365,19 @@ func (s *Service) initialSetup(ctx context.Context) error {
 }
 
 // applyRemoteOverrides updates service-level settings (log level, cert config)
-// from the panel's NodeConfig. Returns true if cert paths changed (kernel restart needed).
-func (s *Service) applyRemoteOverrides(ctx context.Context, nc *model.NodeSpec) bool {
+// from the panel's NodeConfig. Returns true if cert material changed (kernel restart needed).
+func (s *Service) applyRemoteOverrides(ctx context.Context, nc *model.NodeSpec) (bool, error) {
 	if nc == nil {
-		return false
+		return false, nil
 	}
 
 	// Dynamic Log Level (Kernel)
 	if nc.KernelLogLevel != "" && nc.KernelLogLevel != s.cfg.Kernel.LogLevel {
-		nlog.Core().Info("cert: kernel log level override", "old", s.cfg.Kernel.LogLevel, "new", nc.KernelLogLevel)
+		nlog.Core().Info("kernel: log level override", "old", s.cfg.Kernel.LogLevel, "new", nc.KernelLogLevel)
 		s.cfg.Kernel.LogLevel = nc.KernelLogLevel
+		if setter, ok := s.kernel.(interface{ SetLogLevel(string) }); ok {
+			setter.SetLogLevel(nc.KernelLogLevel)
+		}
 	}
 
 	// Certificate configuration from panel (panel-first: takes precedence over local config)
@@ -347,22 +394,30 @@ func (s *Service) applyRemoteOverrides(ctx context.Context, nc *model.NodeSpec) 
 		s.cfg.Cert.Domain = nc.Domain
 	}
 
-	return false
+	return false, nil
 }
 
-// applyPanelCert converts a panel CertConfig into the local config format and
-// reconfigures the cert manager. Reports whether cert paths changed.
-func (s *Service) applyNodeCert(ctx context.Context, newCfg *config.CertConfig) bool {
+// applyNodeCert converts a panel CertConfig into the local config format and
+// reconfigures the cert manager. Reports whether cert material changed.
+func (s *Service) applyNodeCert(ctx context.Context, newCfg *config.CertConfig) (bool, error) {
 	if newCfg == nil {
-		return false
+		return false, nil
 	}
 	cfgCopy := *newCfg
-	cfgCopy.CertDir = s.cfg.Cert.CertDir
+	if cfgCopy.CertDir == "" {
+		cfgCopy.CertDir = s.cfg.Cert.CertDir
+	}
+	if cfgCopy.ACMEStorageDir == "" {
+		cfgCopy.ACMEStorageDir = s.cfg.Cert.ACMEStorageDir
+	}
+	if cfgCopy.HTTPPort == 0 {
+		cfgCopy.HTTPPort = s.cfg.Cert.HTTPPort
+	}
 
 	changed, err := s.cert.Reconfigure(ctx, cfgCopy)
 	if err != nil {
 		nlog.Core().Error("failed to apply runtime cert config", "mode", cfgCopy.CertMode, "error", err)
-		return false
+		return false, err
 	}
 	s.cfg.Cert = cfgCopy
 	if changed {
@@ -373,7 +428,7 @@ func (s *Service) applyNodeCert(ctx context.Context, newCfg *config.CertConfig) 
 			nlog.Core().Info(msg)
 		}
 	}
-	return changed
+	return changed, nil
 }
 
 // startWSClient starts the push client goroutine if a client is configured.
@@ -420,8 +475,15 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	}
 }
 
+func (s *Service) resetSourceETags() {
+	if source, ok := s.source.(interface{ ResetETags() }); ok {
+		source.ResetETags()
+	}
+}
+
 func (s *Service) requestWSResync(ctx context.Context, reason string) {
 	s.wsResyncVersion++
+	s.resetSourceETags()
 	if !s.wsResyncPending.CompareAndSwap(false, true) {
 		return
 	}
@@ -452,20 +514,31 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		s.metricsMu.Lock()
 		s.wsDisconnectAt = time.Time{}
 		s.metricsMu.Unlock()
+		// Force re-reporting active devices after WS reconnect.
+		if s.tracker != nil {
+			s.tracker.ResetDeviceReportHash()
+		}
 		// Use nodeLog if available, otherwise core
 		if s.nodeLog != nil {
 			s.nodeLog.Info("ws connected")
 		} else {
 			nlog.Core().Info("ws connected")
 		}
-		// 连接恢复时即使已有请求在途，也必须保留后续协调要求。
-		s.requestWSResync(ctx, "connected")
+		if s.lastConfig == nil {
+			s.requestWSResync(ctx, "missing_initial_config")
+		} else {
+			// 连接恢复时即使已有请求在途，也必须保留后续协调要求。
+			s.requestWSResync(ctx, "connected")
+		}
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
 			s.wsDisconnectAt = time.Now()
 		}
 		s.metricsMu.Unlock()
+		if s.machineMailbox != nil {
+			s.machineMailbox.ResetUserBaseline()
+		}
 		if s.nodeLog != nil {
 			s.nodeLog.Info("ws disconnected")
 		} else {
@@ -473,54 +546,92 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// Clear global device state on disconnect
 		s.kernel.ClearGlobalDevices()
+		s.resetSourceETags()
 		s.pullViaAPIAsync(ctx)
 	}
 }
 
-// wsDiscovery periodically checks WS availability:
-//
-//  1. REST-only mode (wsClient == nil): Re-handshake to check if panel now has
-//     WS enabled. If so, create and start a WS client. This handles the case
-//     where WS was not enabled at startup but enabled later.
-//
-//  2. WS disconnected for >10 min: Re-handshake to check if WS config changed.
-//     If WS is now disabled, stop the WS client and switch to REST-only.
-//     If WS config changed (different URL/channel), restart with new config.
-func (s *Service) wsDiscovery(ctx context.Context) {
+func (s *Service) needsWSDiscovery() bool {
 	if !s.source.SupportsDiscovery() {
-		return
+		return false
 	}
-
-	needsCheck := false
 	if s.wsClient == nil {
-		needsCheck = true
 		nlog.Core().Debug("push discovery: no push client, checking if control plane enabled push")
-	} else if !s.wsDisconnectAt.IsZero() && time.Since(s.wsDisconnectAt) > 10*time.Minute {
-		needsCheck = true
-		nlog.Core().Debug("push discovery: push disconnected for >10min, re-checking")
+		return true
 	}
-	if !needsCheck {
+	if s.wsClient.IsConnected() {
+		if !s.wsDisconnectAt.IsZero() {
+			s.metricsMu.Lock()
+			s.wsDisconnectAt = time.Time{}
+			s.metricsMu.Unlock()
+		}
+		return false
+	}
+	if !s.wsDisconnectAt.IsZero() && time.Since(s.wsDisconnectAt) > 10*time.Minute {
+		nlog.Core().Debug("push discovery: push disconnected for >10min, re-checking")
+		return true
+	}
+	return false
+}
+
+// wsDiscoveryAsync runs Discover in a background goroutine so a slow/blackholed
+// panel never stalls the main Service.Run event loop.
+func (s *Service) wsDiscoveryAsync(ctx context.Context) {
+	if !s.needsWSDiscovery() {
 		return
 	}
+	if !s.discoveryActive.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.discoveryActive.Store(false)
+		pushClient, err := s.source.Discover(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
+		select {
+		case s.discoveryResults <- discoveryResult{pushClient: pushClient, err: err}:
+		case <-ctx.Done():
+		}
+	}()
+}
 
+// wsDiscovery synchronously performs one WS discovery cycle (used in tests).
+func (s *Service) wsDiscovery(ctx context.Context) {
+	if !s.needsWSDiscovery() {
+		return
+	}
 	pushClient, err := s.source.Discover(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)
-	if err != nil {
-		nlog.Core().Debug("push discovery failed", "error", err)
+	s.applyDiscoveryResult(ctx, discoveryResult{pushClient: pushClient, err: err})
+}
+
+func (s *Service) applyDiscoveryResult(ctx context.Context, res discoveryResult) {
+	if res.err != nil {
+		nlog.Core().Debug("push discovery failed", "error", res.err)
 		return
 	}
 	if s.source.SupportsPolling() {
 		s.pullViaAPIAsync(ctx)
 	}
 
-	if pushClient != nil {
+	if res.pushClient != nil {
 		if s.wsClient == nil {
 			nlog.Core().Info("push discovery: control plane enabled push, creating client")
-			s.metricsMu.Lock()
-			s.wsClient = pushClient
-			s.wsDisconnectAt = time.Time{}
-			s.metricsMu.Unlock()
-			s.startWSClient(ctx)
+		} else {
+			if s.wsClient.IsConnected() {
+				// Client reconnected while discovery was in flight; keep active client.
+				s.metricsMu.Lock()
+				s.wsDisconnectAt = time.Time{}
+				s.metricsMu.Unlock()
+				return
+			}
+			nlog.Core().Info("push discovery: replacing stale push client after prolonged disconnect")
+			if s.wsCancel != nil {
+				s.wsCancel()
+			}
 		}
+		s.metricsMu.Lock()
+		s.wsClient = res.pushClient
+		s.wsDisconnectAt = time.Time{}
+		s.metricsMu.Unlock()
+		s.startWSClient(ctx)
 	} else if s.wsClient != nil {
 		nlog.Core().Info("push discovery: control plane disabled push, switching to polling")
 		if s.wsCancel != nil {
@@ -553,12 +664,19 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if s.nodeLog == nil {
 			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
 		}
-		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(event.Users)))
 		s.metricsMu.Lock()
 		s.lastConfig = event.Config
+		userCount := len(s.lastUsers)
 		s.metricsMu.Unlock()
-		s.lastConfigHash = newConfigHash
-		s.applyRemoteOverrides(ctx, event.Config)
+		s.stateVersion++
+		s.resetSourceETags()
+		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", userCount))
+		if _, certErr := s.applyRemoteOverrides(ctx, event.Config); certErr != nil {
+			s.lastConfigHash = ""
+			s.invalidatePollCache()
+		} else {
+			s.lastConfigHash = newConfigHash
+		}
 		s.applyChanges(ctx, true, false)
 
 	case controlplane.EventSyncUsers:
@@ -569,6 +687,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if newHash == s.lastUserHash && !s.kernelStateUnknown {
 			return
 		}
+		s.stateVersion++
+		s.resetSourceETags()
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users updated, %d users", len(event.Users)))
 		}
@@ -578,6 +698,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if len(event.DeltaUsers) == 0 {
 			return
 		}
+		s.stateVersion++
+		s.resetSourceETags()
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users delta: %s, %d users", event.DeltaAction, len(event.DeltaUsers)))
 		}
@@ -594,9 +716,31 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	}
 }
 
+// checkCertRenewal detects ACME certificate renewals independently of REST
+// polling so WS-connected and standalone modes reload renewed certs, and
+// retries if a kernel reload fails.
+func (s *Service) checkCertRenewal(ctx context.Context) {
+	if s.cert.CertRenewed() {
+		nlog.Core().Info("certificate renewed, scheduling kernel reload")
+		s.certReloadPending = true
+	}
+	if !s.certReloadPending {
+		return
+	}
+	if s.lastConfig == nil || len(s.lastUsers) == 0 {
+		s.certReloadPending = false
+		return
+	}
+	s.applyChanges(ctx, true, false)
+	if !s.kernelStateUnknown && s.lastConfigHash != "" {
+		s.certReloadPending = false
+	}
+}
+
 // pollTick 在 WS 连接期间仍重试尚未完成的 REST 协调。
+// 如果尚未取得初始配置（例如机器模式冷启动）或内核处于未就绪状态，即使 WS 已连接也必须继续通过 REST 轮询拉取。
 func (s *Service) pollTick(ctx context.Context, connected bool) {
-	if connected && !s.wsResyncPending.Load() {
+	if connected && !s.wsResyncPending.Load() && s.lastConfig != nil && !s.kernelStateUnknown {
 		return
 	}
 	s.pullViaAPIAsync(ctx)
@@ -620,7 +764,7 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 	currentConfigHash := s.lastConfigHash
 	resyncVersion := s.wsResyncVersion
-	certChanged := s.cert.CertRenewed()
+	stateVersion := s.stateVersion
 
 	go func() {
 		delivered := false
@@ -639,11 +783,11 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		}
 		s.pullBackoff.onSuccess()
 
-		result := pullResult{certChanged: certChanged, resyncVersion: resyncVersion}
+		result := pullResult{resyncVersion: resyncVersion, stateVersion: stateVersion}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
-			if result.configHash == currentConfigHash && !certChanged {
+			if result.configHash == currentConfigHash {
 				result.config = nil
 			}
 		}
@@ -663,14 +807,18 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 // invalidatePollCache 避免未应用的 REST 快照被 304 响应掩盖。
 func (s *Service) invalidatePollCache() {
 	s.wsResyncPending.Store(true)
-	if source, ok := s.source.(interface{ ResetETags() }); ok {
-		source.ResetETags()
-	}
+	s.resetSourceETags()
 }
 
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	defer s.pullActive.Store(false)
+	// Discard stale REST snapshot if WS already mutated state while this poll
+	// was in flight; keep wsResyncPending armed so reconciliation can retry cleanly.
+	if result.stateVersion != s.stateVersion {
+		nlog.Core().Debug("discarding stale REST poll superseded by newer WS event")
+		return
+	}
 	// 即使单独更新部分成功，也重新获取完整快照，让后续轮询校准状态。
 	defer func() {
 		if s.lastConfigHash == "" || s.lastUserHash == "" {
@@ -682,11 +830,6 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		s.wsResyncPending.Store(false)
 	}
 	configChanged := false
-
-	if result.certChanged {
-		nlog.Core().Info("certificate renewed, kernel restart needed")
-		configChanged = true
-	}
 
 	if result.config != nil {
 		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
@@ -703,8 +846,14 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			s.metricsMu.Lock()
 			s.lastConfig = result.config
 			s.metricsMu.Unlock()
-			s.lastConfigHash = result.configHash
-			if s.applyRemoteOverrides(ctx, result.config) {
+			certChanged, certErr := s.applyRemoteOverrides(ctx, result.config)
+			if certErr != nil {
+				s.lastConfigHash = ""
+				s.invalidatePollCache()
+			} else {
+				s.lastConfigHash = result.configHash
+			}
+			if certChanged {
 				configChanged = true
 			}
 		}
@@ -730,6 +879,12 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			// 仅恢复服务侧缓存；失败的内核操作可能已经部分生效。
 			s.restoreUserState(prevUsers, prevUserHash)
 		}
+	}
+
+	// Keep machine-mode mailbox user baseline aligned with applied REST snapshot
+	// so future WS deltas never resurrect deleted users or evict added users.
+	if result.users != nil && s.machineMailbox != nil && !s.kernelStateUnknown && s.lastUserHash != "" {
+		s.machineMailbox.SyncUsers(s.lastUsers)
 	}
 }
 
@@ -777,6 +932,10 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
+	if s.tracker != nil && s.kernel.IsRunning() && !s.kernelStateUnknown {
+		// Flush final pre-restart traffic before the kernel counters reset to zero.
+		s.trackAndEnforce(context.Background())
+	}
 	if s.kernelStateUnknown {
 		// 旧实例可能仍占用端口。停止会中断现有连接；Stop 无错误返回，
 		// 无法保证资源已完全释放，因此启动失败仍须保留未知状态并重试。
@@ -791,6 +950,11 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 		return false
 	}
 
+	// Kernel starts with fresh zeroed cumulative counters; clear lastSeen so
+	// post-restart traffic is never undercounted.
+	if s.tracker != nil {
+		s.tracker.ResetCumulativeBaseline()
+	}
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
 	s.kernelStateUnknown = false
@@ -815,10 +979,16 @@ func (s *Service) startWithUsers(ctx context.Context, users []model.UserSpec) {
 		return
 	}
 	if s.lastConfig == nil {
+		// Buffer users arriving before initial config (e.g. WS sync.users before
+		// sync.config) so applyChanges starts the kernel once config arrives.
+		s.updateUserState(users)
 		return
 	}
 	prevUsers, prevHash := s.prepareUserState(users)
-	s.applyRemoteOverrides(ctx, s.lastConfig)
+	if _, err := s.applyRemoteOverrides(ctx, s.lastConfig); err != nil {
+		s.lastConfigHash = ""
+		s.invalidatePollCache()
+	}
 	if !s.startKernel(s.lastConfig, users) {
 		s.restoreUserState(prevUsers, prevHash)
 		s.invalidatePollCache()
@@ -830,14 +1000,24 @@ func (s *Service) startWithUsers(ctx context.Context, users []model.UserSpec) {
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if s.kernelStateUnknown {
-		if len(users) == 0 {
+	if len(users) == 0 {
+		// Always stop the kernel when all users are removed — leaving a sing-box
+		// socks/http inbound running with an empty user list disables auth and
+		// exposes an open proxy.
+		if s.kernel.IsRunning() || s.kernelStateUnknown {
 			s.kernel.Stop()
-			s.updateUserState(users)
-			s.kernelStateUnknown = false
-		} else {
-			s.startWithUsers(ctx, users)
 		}
+		s.appliedState.Config = nil
+		s.appliedState.Users = nil
+		s.kernelStateUnknown = false
+		s.updateUserState(users)
+		if newHash != "" {
+			s.lastUserHash = newHash
+		}
+		return
+	}
+	if s.kernelStateUnknown {
+		s.startWithUsers(ctx, users)
 		return
 	}
 	if !s.kernel.IsRunning() {
@@ -933,6 +1113,16 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 		filtered := subtractUsers(s.lastUsers, matched)
+		if len(filtered) == 0 {
+			if s.kernel.IsRunning() || s.kernelStateUnknown {
+				s.kernel.Stop()
+			}
+			s.appliedState.Config = nil
+			s.appliedState.Users = nil
+			s.kernelStateUnknown = false
+			s.updateUserState(filtered)
+			return
+		}
 		if s.kernelStateUnknown {
 			s.applyUserUpdate(ctx, filtered, "")
 			return
@@ -1292,8 +1482,8 @@ func (s *Service) sendDeviceBatch() {
 		return
 	}
 
-	devices := s.tracker.FlushAliveIPs()
-	// FlushAliveIPs returns nil if no changes since last flush
+	devices := s.tracker.FlushDeviceReport()
+	// FlushDeviceReport returns nil if no changes since last WS device report
 	if devices == nil {
 		nlog.Core().Debug("device snapshot unchanged, skipping")
 		return

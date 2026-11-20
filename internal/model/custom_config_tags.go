@@ -67,18 +67,20 @@ func collectCustomConfigOutboundTagSources(path string) ([]outboundTagSource, er
 		}
 	}
 
-	items, ok := toSliceOfMaps(decoded["outbounds"])
-	if !ok {
-		return nil, nil
-	}
-	sources := make([]outboundTagSource, 0, len(items))
-	for i, item := range items {
-		tag, _ := item["tag"].(string)
-		tag = strings.TrimSpace(tag)
-		if tag == "" {
+	var sources []outboundTagSource
+	for _, section := range []string{"outbounds", "endpoints"} {
+		items, ok := toSliceOfMaps(decoded[section])
+		if !ok {
 			continue
 		}
-		sources = append(sources, outboundTagSource{Tag: tag, Source: fmt.Sprintf("kernel.custom_config.outbounds[%d]", i)})
+		for i, item := range items {
+			tag, _ := item["tag"].(string)
+			tag = strings.TrimSpace(tag)
+			if tag == "" {
+				continue
+			}
+			sources = append(sources, outboundTagSource{Tag: tag, Source: fmt.Sprintf("kernel.custom_config.%s[%d]", section, i)})
+		}
 	}
 	return sources, nil
 }

@@ -58,6 +58,11 @@ var (
 	netPrevSent uint64
 	netPrevTime time.Time
 	netHasBase  bool
+
+	collectMu    sync.Mutex
+	cachedStatus Status
+	cachedAt     time.Time
+	collectTTL   = time.Second
 )
 
 // skipInterface returns true for loopback and common virtual interfaces.
@@ -74,6 +79,9 @@ func skipInterface(name string) bool {
 // collectNetSpeed calculates network in/out bytes per second since last call.
 // Returns -1, -1 on first call or if counters decreased (reboot).
 func collectNetSpeed() (inSpeed, outSpeed float64) {
+	netMu.Lock()
+	defer netMu.Unlock()
+
 	counters, err := net.IOCounters(true) // per-interface
 	if err != nil {
 		nlog.Core().Debug("failed to get network counters", "error", err)
@@ -90,9 +98,6 @@ func collectNetSpeed() (inSpeed, outSpeed float64) {
 	}
 
 	now := time.Now()
-
-	netMu.Lock()
-	defer netMu.Unlock()
 
 	if !netHasBase {
 		netPrevRecv, netPrevSent, netPrevTime, netHasBase = totalRecv, totalSent, now, true
@@ -117,8 +122,30 @@ func collectNetSpeed() (inSpeed, outSpeed float64) {
 	return inSpeed, outSpeed
 }
 
-// Collect gathers current system metrics
+// Collect gathers current system metrics. Concurrent multi-node callers within
+// a short TTL share the same snapshot so they never clobber CPU/net baselines.
 func Collect() Status {
+	collectMu.Lock()
+	defer collectMu.Unlock()
+
+	if !cachedAt.IsZero() && time.Since(cachedAt) < collectTTL {
+		cp := cachedStatus
+		if len(cachedStatus.CPUPerCore) > 0 {
+			cp.CPUPerCore = append([]float64(nil), cachedStatus.CPUPerCore...)
+		}
+		return cp
+	}
+
+	s := collectUncached()
+	cachedStatus = s
+	cachedAt = time.Now()
+	if len(s.CPUPerCore) > 0 {
+		s.CPUPerCore = append([]float64(nil), s.CPUPerCore...)
+	}
+	return s
+}
+
+func collectUncached() Status {
 	var s Status
 
 	s.Uptime = uint64(time.Since(startTime).Seconds())

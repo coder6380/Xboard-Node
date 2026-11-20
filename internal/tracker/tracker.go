@@ -49,20 +49,27 @@ type Tracker struct {
 	// Readers load this pointer without any lock.
 	live atomic.Pointer[snapshot]
 
-	// aliveIPsBuf is a reusable buffer for FlushAliveIPs output.
-	// Avoids allocating a new map+slice every 60s.
-	aliveIPsBuf map[int][]string
+	// restoredAliveIPs holds alive IPs restored after a failed panel report,
+	// merged into the next FlushAliveIPs() call. Protected by mu.
+	restoredAliveIPs map[int][]string
 
-	// lastAliveIPsHash detects changes to avoid duplicate reports.
+	// lastAliveIPsHash detects changes for periodic panel reports.
 	lastAliveIPsHash string
+
+	// lastDeviceReportHash detects changes independently for WS device reports.
+	lastDeviceReportHash string
+
+	// trackIntervalSec is the sampling interval in seconds for speed calculation.
+	trackIntervalSec atomic.Int64
 }
 
 func New() *Tracker {
 	t := &Tracker{
-		lastSeen:       make(map[int][2]int64),
-		pendingTraffic: make(map[int][2]int64),
-		aliveIPsBuf:    make(map[int][]string),
+		lastSeen:         make(map[int][2]int64),
+		pendingTraffic:   make(map[int][2]int64),
+		restoredAliveIPs: make(map[int][]string),
 	}
+	t.trackIntervalSec.Store(10)
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
 		traffic:  make(map[int][2]int64),
@@ -70,6 +77,15 @@ func New() *Tracker {
 		online:   make(map[int]int),
 	})
 	return t
+}
+
+// SetTrackInterval configures the tracking interval in seconds used to compute
+// per-second inbound/outbound speeds. Values <= 0 default to 10s.
+func (t *Tracker) SetTrackInterval(seconds int) {
+	if seconds <= 0 {
+		seconds = 10
+	}
+	t.trackIntervalSec.Store(int64(seconds))
 }
 
 // Process computes per-user traffic deltas from cumulative kernel counters.
@@ -159,43 +175,92 @@ func (t *Tracker) HasTraffic() bool {
 	return len(t.pendingTraffic) > 0
 }
 
-// FlushAliveIPs returns per-user alive IPs.
-// Reuses internal buffer. Returns nil if unchanged.
+// FlushAliveIPs returns a fresh copy of per-user alive IPs for panel reporting.
+// Returns nil if unchanged and no previously failed alive IPs are pending restore.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
 	s := t.live.Load()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Calculate hash of current aliveIPs
+	hasRestored := len(t.restoredAliveIPs) > 0
 	currentHash := calcAliveIPsHash(s.aliveIPs)
 
-	// If no changes, return nil to avoid duplicate reporting
-	if currentHash == t.lastAliveIPsHash {
+	// If no changes and nothing restored from a failed report, return nil.
+	if !hasRestored && currentHash == t.lastAliveIPsHash {
 		return nil
 	}
 
 	t.lastAliveIPsHash = currentHash
 
-	// Clear old buffer entries.
-	for k := range t.aliveIPsBuf {
-		delete(t.aliveIPsBuf, k)
-	}
-
-	// Fill buffer from snapshot.
+	result := make(map[int][]string, len(s.aliveIPs)+len(t.restoredAliveIPs))
 	for uid, ips := range s.aliveIPs {
-		buf := t.aliveIPsBuf[uid]
-		if buf == nil {
-			buf = make([]string, 0, len(ips))
-		}
-		buf = buf[:0]
+		list := make([]string, 0, len(ips))
 		for ip := range ips {
-			buf = append(buf, ip)
+			list = append(list, ip)
 		}
-		t.aliveIPsBuf[uid] = buf
+		result[uid] = list
+	}
+	if hasRestored {
+		for uid, ipList := range t.restoredAliveIPs {
+			existing := result[uid]
+			existSet := make(map[string]struct{}, len(existing)+len(ipList))
+			for _, ip := range existing {
+				existSet[ip] = struct{}{}
+			}
+			for _, ip := range ipList {
+				if _, ok := existSet[ip]; !ok {
+					existing = append(existing, ip)
+					existSet[ip] = struct{}{}
+				}
+			}
+			result[uid] = existing
+		}
+		t.restoredAliveIPs = make(map[int][]string)
 	}
 
-	return t.aliveIPsBuf
+	return result
+}
+
+// ResetCumulativeBaseline clears cached cumulative kernel counters so a fresh
+// kernel instance starting from zero does not undercount post-restart traffic.
+func (t *Tracker) ResetCumulativeBaseline() {
+	t.mu.Lock()
+	t.lastSeen = make(map[int][2]int64)
+	t.mu.Unlock()
+}
+
+// ResetDeviceReportHash clears the WS device-report deduplication hash so the
+// next FlushDeviceReport re-sends active devices after a WS reconnect.
+func (t *Tracker) ResetDeviceReportHash() {
+	t.mu.Lock()
+	t.lastDeviceReportHash = ""
+	t.mu.Unlock()
+}
+
+// FlushDeviceReport returns a fresh copy of per-user alive IPs for WS device
+// reporting, using its own deduplication hash independent of FlushAliveIPs.
+func (t *Tracker) FlushDeviceReport() map[int][]string {
+	s := t.live.Load()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	currentHash := calcAliveIPsHash(s.aliveIPs)
+	if currentHash == t.lastDeviceReportHash {
+		return nil
+	}
+	t.lastDeviceReportHash = currentHash
+
+	result := make(map[int][]string, len(s.aliveIPs))
+	for uid, ips := range s.aliveIPs {
+		list := make([]string, 0, len(ips))
+		for ip := range ips {
+			list = append(list, ip)
+		}
+		result[uid] = list
+	}
+	return result
 }
 
 // calcAliveIPsHash computes a deterministic hash for change detection.
@@ -243,17 +308,20 @@ func (t *Tracker) CurrentOnline() map[int]int {
 	return cp
 }
 
-// RestoreAliveIPs merges alive IPs back in (used when push to panel fails).
-// Note: this operates on the buffer, which will be overwritten next Process().
+// RestoreAliveIPs merges alive IPs back in (used when push to panel fails)
+// and invalidates the deduplication hash so the next FlushAliveIPs retries them.
 func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
+	if len(data) == 0 {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.lastAliveIPsHash = ""
 	for uid, ipList := range data {
-		ips := t.aliveIPsBuf[uid]
+		ips := t.restoredAliveIPs[uid]
 		if ips == nil {
 			ips = make([]string, 0, len(ipList))
 		}
-		// Use map for O(n) dedup instead of O(n²) linear search
 		existMap := make(map[string]struct{}, len(ips)+len(ipList))
 		for _, existing := range ips {
 			existMap[existing] = struct{}{}
@@ -264,7 +332,7 @@ func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
 				existMap[ip] = struct{}{}
 			}
 		}
-		t.aliveIPsBuf[uid] = ips
+		t.restoredAliveIPs[uid] = ips
 	}
 }
 
@@ -290,13 +358,21 @@ func (t *Tracker) TotalConnections() int64 {
 // InboundSpeed returns the last observed inbound (download) speed in bytes/second.
 // Lock-free: reads from live snapshot.
 func (t *Tracker) InboundSpeed() int64 {
-	return t.live.Load().inSpeed / 10
+	interval := t.trackIntervalSec.Load()
+	if interval <= 0 {
+		interval = 10
+	}
+	return t.live.Load().inSpeed / interval
 }
 
 // OutboundSpeed returns the last observed outbound (upload) speed in bytes/second.
 // Lock-free: reads from live snapshot.
 func (t *Tracker) OutboundSpeed() int64 {
-	return t.live.Load().outSpeed / 10
+	interval := t.trackIntervalSec.Load()
+	if interval <= 0 {
+		interval = 10
+	}
+	return t.live.Load().outSpeed / interval
 }
 
 // copyTrafficMap creates a shallow copy of the traffic map.

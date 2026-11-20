@@ -104,9 +104,16 @@ load_health_port_from_config() {
 
 rollback_install() {
     log_warn "Rolling back installation"
+    # Stop (and disable on failed fresh install) BEFORE deleting service unit
+    # or restoring binaries so we never orphan a running daemon or hit ETXTBSY.
+    stop_existing_service
+    if [ "$SERVICE_EXISTED" -eq 0 ]; then
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
     if [ -n "$BACKUP_PATH" ] && [ -d "$BACKUP_PATH" ]; then
         if [ -f "$BACKUP_PATH/xboard-node" ]; then
-            install -m 755 "$BACKUP_PATH/xboard-node" "$BINARY_PATH"
+            install -m 755 "$BACKUP_PATH/xboard-node" "${BINARY_PATH}.new"
+            mv -f "${BINARY_PATH}.new" "$BINARY_PATH"
         else
             rm -f "$BINARY_PATH"
         fi
@@ -126,9 +133,10 @@ rollback_install() {
             rm -f "$INSTALL_META"
         fi
         if [ -f "$BACKUP_PATH/xbctl" ]; then
-            install -m 755 "$BACKUP_PATH/xbctl" "$CLI_PATH"
+            install -m 755 "$BACKUP_PATH/xbctl" "${CLI_PATH}.new"
+            mv -f "${CLI_PATH}.new" "$CLI_PATH"
         else
-            rm -f "$CLI_PATH"
+            rm -f "$CLI_PATH" /usr/bin/xbctl
         fi
         if [ -f "$BACKUP_PATH/${SERVICE_NAME}" ]; then
             install -m "$SERVICE_MODE" "$BACKUP_PATH/${SERVICE_NAME}" "$SERVICE_PATH"
@@ -146,8 +154,6 @@ rollback_install() {
             show_recent_logs
             return 1
         fi
-    else
-        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
     log_warn "Rollback complete"
 }
@@ -223,53 +229,105 @@ parse_args() {
                 ACTION="$1"
                 shift
                 ;;
+            --mode=*)
+                MODE="${1#*=}"
+                shift
+                ;;
             --mode)
                 MODE="$2"
                 shift 2
+                ;;
+            --panel=*|-a=*|--api=*)
+                PANEL_URL="${1#*=}"
+                shift
                 ;;
             --panel|-a|--api)
                 PANEL_URL="$2"
                 shift 2
                 ;;
+            --token=*|-t=*)
+                TOKEN="${1#*=}"
+                shift
+                ;;
             --token|-t)
                 TOKEN="$2"
                 shift 2
+                ;;
+            --node-id=*|-n=*)
+                NODE_ID="${1#*=}"
+                shift
                 ;;
             --node-id|-n)
                 NODE_ID="$2"
                 shift 2
                 ;;
+            --node-type=*|-T=*)
+                NODE_TYPE="${1#*=}"
+                shift
+                ;;
             --node-type|-T)
                 NODE_TYPE="$2"
                 shift 2
+                ;;
+            --machine-id=*)
+                MACHINE_ID="${1#*=}"
+                shift
                 ;;
             --machine-id)
                 MACHINE_ID="$2"
                 shift 2
                 ;;
+            --kernel=*|-k=*)
+                KERNEL_TYPE="${1#*=}"
+                shift
+                ;;
             --kernel|-k)
                 KERNEL_TYPE="$2"
                 shift 2
+                ;;
+            --version=*)
+                RELEASE_VERSION="${1#*=}"
+                shift
                 ;;
             --version)
                 RELEASE_VERSION="$2"
                 shift 2
                 ;;
+            --binary=*)
+                BINARY_SOURCE="${1#*=}"
+                shift
+                ;;
             --binary)
                 BINARY_SOURCE="$2"
                 shift 2
+                ;;
+            --xbctl-binary=*)
+                CLI_BINARY_SOURCE="${1#*=}"
+                shift
                 ;;
             --xbctl-binary)
                 CLI_BINARY_SOURCE="$2"
                 shift 2
                 ;;
+            --health-port=*)
+                HEALTH_PORT="${1#*=}"
+                shift
+                ;;
             --health-port)
                 HEALTH_PORT="$2"
                 shift 2
                 ;;
+            --gomemlimit=*)
+                RUNTIME_GOMEMLIMIT="${1#*=}"
+                shift
+                ;;
             --gomemlimit)
                 RUNTIME_GOMEMLIMIT="$2"
                 shift 2
+                ;;
+            --gogc=*)
+                RUNTIME_GOGC="${1#*=}"
+                shift
                 ;;
             --gogc)
                 RUNTIME_GOGC="$2"
@@ -303,8 +361,8 @@ parse_args() {
     fi
 
     case "$KERNEL_TYPE" in
-        singbox|SingBox|SINGBOX) KERNEL_TYPE="singbox" ;;
-        xray|Xray|XRAY) KERNEL_TYPE="xray" ;;
+        singbox|SingBox|SINGBOX|sing-box|Sing-Box) KERNEL_TYPE="singbox" ;;
+        xray|Xray|XRAY|xray-core|Xray-Core) KERNEL_TYPE="xray" ;;
         *) ;;
     esac
 
@@ -806,8 +864,10 @@ perform_upgrade() {
     render_service
     backup_existing_state
     load_health_port_from_config "$CONFIG_FILE"
-    install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
-    install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
+    install -m 755 "$TMP_DIR/xboard-node" "${BINARY_PATH}.new"
+    mv -f "${BINARY_PATH}.new" "$BINARY_PATH"
+    install -m 755 "$TMP_DIR/xbctl" "${CLI_PATH}.new"
+    mv -f "${CLI_PATH}.new" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m "$SERVICE_MODE" "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
@@ -816,6 +876,18 @@ perform_upgrade() {
         log_error "Upgrade health check failed"
         show_recent_logs
         return 1
+    fi
+    if [ -f "$INSTALL_META" ]; then
+        upgraded_ver="$RELEASE_VERSION"
+        if [ "$upgraded_ver" = "latest" ] || [ -z "$upgraded_ver" ]; then
+            detected_ver=$("$BINARY_PATH" -v 2>/dev/null | awk '{print $2}')
+            if [ -n "$detected_ver" ]; then
+                upgraded_ver="$detected_ver"
+            fi
+        fi
+        if [ -n "$upgraded_ver" ]; then
+            sed -i.bak "s/\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"version\": \"${upgraded_ver}\"/" "$INSTALL_META" 2>/dev/null && rm -f "${INSTALL_META}.bak" || true
+        fi
     fi
     log_info "Upgrade succeeded"
 }

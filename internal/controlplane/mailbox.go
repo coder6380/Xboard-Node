@@ -60,6 +60,33 @@ func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpe
 	}
 }
 
+// ResetUserBaseline invalidates the cached full user baseline (e.g. on WS
+// disconnect) so any subsequent delta before a fresh full snapshot triggers
+// REST reconciliation instead of mutating a stale user list.
+func (m *NodeMailbox) ResetUserBaseline() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.dirtyUsers {
+		m.users = nil
+		m.hasFullUserState = false
+	}
+}
+
+// SyncUsers updates the mailbox user baseline after a REST snapshot is applied,
+// unless newer undrained WS user updates are already buffered.
+func (m *NodeMailbox) SyncUsers(users []model.UserSpec) {
+	if users == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dirtyUsers {
+		return
+	}
+	m.users = cloneUsers(users)
+	m.hasFullUserState = true
+}
+
 func (m *NodeMailbox) Apply(event Event) {
 	m.mu.Lock()
 	changed := false

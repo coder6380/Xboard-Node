@@ -63,7 +63,7 @@ func ValidateCustomRouteRules(rules []CustomRouteRule, kernelType string, availa
 				return fmt.Errorf("custom_route_rules[%d].action.target is required when action.type is route", i)
 			}
 			if availableTags != nil {
-				if _, ok := availableTags[strings.ToLower(target)]; !ok {
+				if _, ok := availableTags[target]; !ok {
 					return fmt.Errorf("custom_route_rules[%d].action.target references unknown outbound %q", i, rule.Action.Target)
 				}
 			}

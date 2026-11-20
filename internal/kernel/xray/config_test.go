@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -387,25 +389,27 @@ func TestBuildRouting_WithCustomRouteRules(t *testing.T) {
 
 	routing := buildRouting(nil, customRules, nil)
 	xrayRules := routing["rules"].([]M)
-	if len(xrayRules) != 6 {
-		t.Fatalf("expected 6 rules, got %d", len(xrayRules))
+	// 1 combined custom rule + 1 built-in private IP block rule
+	if len(xrayRules) != 2 {
+		t.Fatalf("expected 2 rules, got %d", len(xrayRules))
 	}
-	if xrayRules[0]["outboundTag"] != "warp-jp" {
-		t.Fatalf("expected first custom outbound warp-jp, got %v", xrayRules[0]["outboundTag"])
+	r := xrayRules[0]
+	if r["outboundTag"] != "warp-jp" {
+		t.Fatalf("expected first custom outbound warp-jp, got %v", r["outboundTag"])
 	}
-	if got := xrayRules[0]["domain"].([]string); len(got) != 2 || got[0] != "full.example.com" || got[1] != "domain:example.org" {
+	if got := r["domain"].([]string); len(got) != 2 || got[0] != "full:full.example.com" || got[1] != "domain:example.org" {
 		t.Fatalf("unexpected custom domains: %v", got)
 	}
-	if got := xrayRules[1]["port"]; got != "80,443-445" {
+	if got := r["port"]; got != "80,443-445" {
 		t.Fatalf("unexpected port matcher: %v", got)
 	}
-	if got := xrayRules[2]["network"]; got != "tcp,udp" {
+	if got := r["network"]; got != "tcp,udp" {
 		t.Fatalf("unexpected network matcher: %v", got)
 	}
-	if got := xrayRules[3]["source"].([]string); len(got) != 1 || got[0] != "192.168.1.0/24" {
+	if got := r["source"].([]string); len(got) != 1 || got[0] != "192.168.1.0/24" {
 		t.Fatalf("unexpected source cidr matcher: %v", got)
 	}
-	if got := xrayRules[4]["sourcePort"]; got != "1000-1002" {
+	if got := r["sourcePort"]; got != "1000-1002" {
 		t.Fatalf("unexpected source port matcher: %v", got)
 	}
 }
@@ -614,5 +618,69 @@ func TestExtractECHServerKeys(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tt.expect)
 			}
 		})
+	}
+}
+
+func TestBuildInbound_PreservesReusePort(t *testing.T) {
+	for _, proto := range []string{"vmess", "vless", "trojan", "http", "hysteria"} {
+		t.Run(proto, func(t *testing.T) {
+			nc := &model.NodeSpec{
+				Protocol:   proto,
+				ServerPort: 443,
+				Version:    2,
+				TLS:        1,
+			}
+			inb := buildInbound(nc, testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+			ss, ok := inb["streamSettings"].(M)
+			if !ok {
+				t.Fatalf("missing streamSettings for %s", proto)
+			}
+			sockopt, ok := ss["sockopt"].(M)
+			if !ok || sockopt["reusePort"] != true {
+				t.Fatalf("reusePort lost in streamSettings for %s: %#v", proto, ss)
+			}
+		})
+	}
+}
+
+func TestToMemoryUser_SS2022MatchesConfigKey(t *testing.T) {
+	u := model.UserSpec{ID: 7, UUID: "c7a10292-6d2c-4934-8c88-e925b42d2077"}
+	nc := &model.NodeSpec{
+		Protocol:  "shadowsocks",
+		Cipher:    "2022-blake3-aes-128-gcm",
+		ServerKey: "dGVzdC1zZXJ2ZXIta2V5LTAw",
+	}
+	inb := buildShadowsocks(M{}, nc, []model.UserSpec{u})
+	clients := inb["settings"].(M)["clients"].([]M)
+	wantKey := clients[0]["password"].(string)
+
+	mu, err := toMemoryUser("shadowsocks", nc, u)
+	if err != nil {
+		t.Fatalf("toMemoryUser error: %v", err)
+	}
+	gotKey := fmt.Sprintf("%v", mu.Account)
+	if !strings.Contains(gotKey, wantKey) {
+		t.Fatalf("SS2022 MemoryAccount key mismatch: got %s, want %s", gotKey, wantKey)
+	}
+}
+
+func TestBuildRealitySettings_StringSliceAndBareDest(t *testing.T) {
+	nc := &model.NodeSpec{
+		TLS: 2,
+		TLSSettings: map[string]any{
+			"private_key": "priv",
+			"short_id":    []string{"ab12", "cd34"},
+			"dest":        "www.example.com",
+			"server_port": 8443,
+			"server_name": "www.example.com",
+		},
+	}
+	r := buildRealitySettings(nc)
+	sids, ok := r["shortIds"].([]string)
+	if !ok || len(sids) != 2 || sids[0] != "ab12" {
+		t.Fatalf("shortIds = %#v, want [ab12 cd34]", r["shortIds"])
+	}
+	if r["dest"] != "www.example.com:8443" {
+		t.Fatalf("dest = %v, want www.example.com:8443", r["dest"])
 	}
 }

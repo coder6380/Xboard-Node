@@ -126,6 +126,40 @@ func credentialEnvironment(data []byte) ([]string, error) {
 	return result, nil
 }
 
+// mergeEnv merges base and override KEY=VALUE slices so override entries
+// replace any existing entry with the same key (Go's syscall.Getenv reads the
+// first occurrence in environ, so appending duplicates would lose to base).
+func mergeEnv(base, override []string) []string {
+	idx := make(map[string]int, len(base)+len(override))
+	out := make([]string, 0, len(base)+len(override))
+	for _, entry := range base {
+		k, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			out = append(out, entry)
+			continue
+		}
+		if pos, exists := idx[k]; exists {
+			out[pos] = entry
+		} else {
+			idx[k] = len(out)
+			out = append(out, entry)
+		}
+	}
+	for _, entry := range override {
+		k, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if pos, exists := idx[k]; exists {
+			out[pos] = entry
+		} else {
+			idx[k] = len(out)
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
 // startManagedProcess 读取凭据并以原样环境启动主程序。
 func startManagedProcess() error {
 	data, err := os.ReadFile(defaultCredentialsPath)
@@ -136,5 +170,5 @@ func startManagedProcess() error {
 	if err != nil {
 		return err
 	}
-	return execManagedProcess(defaultBinaryPath, []string{defaultBinaryPath, "-c", defaultConfigPath}, append(os.Environ(), credentials...))
+	return execManagedProcess(defaultBinaryPath, []string{defaultBinaryPath, "-c", defaultConfigPath}, mergeEnv(os.Environ(), credentials))
 }

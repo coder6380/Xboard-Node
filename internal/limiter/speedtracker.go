@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -58,38 +59,41 @@ func (t *SpeedTracker) UpdateBuckets() {
 
 		newUUIDMap := make(map[string]int, len(currentUsers))
 		activeIDs := make(map[int]struct{}, len(currentUsers))
+		anyLimit := false
 
 		for _, user := range currentUsers {
 			activeIDs[user.ID] = struct{}{}
 			if user.UUID != "" {
 				newUUIDMap[user.UUID] = user.ID
 			}
+			if user.SpeedLimit > 0 {
+				anyLimit = true
+			}
 
 			// Update existing limiter if speed changed
 			if lim, ok := t.buckets[user.ID]; ok {
 				if user.SpeedLimit > 0 {
-					bytesPerSec := int(user.SpeedLimit) * 1_000_000 / 8
-					burst := bytesPerSec
-					if burst < 64*1024 {
-						burst = 64 * 1024
-					}
-					lim.SetLimit(rate.Limit(bytesPerSec))
+					limit, burst := speedLimitToBytesAndBurst(user.SpeedLimit)
+					lim.SetLimit(limit)
 					lim.SetBurst(burst)
 				} else {
+					// Lift throttling on active connections still holding this limiter.
+					lim.SetLimit(rate.Inf)
 					delete(t.buckets, user.ID)
 				}
 			}
 		}
 
 		// Clean up buckets for removed users
-		for id := range t.buckets {
+		for id, lim := range t.buckets {
 			if _, ok := activeIDs[id]; !ok {
+				lim.SetLimit(rate.Inf)
 				delete(t.buckets, id)
 			}
 		}
 
 		t.uuidMap = newUUIDMap
-		t.hasLimits.Store(len(t.buckets) > 0)
+		t.hasLimits.Store(anyLimit)
 	}()
 
 	if t.logFunc != nil {
@@ -123,19 +127,16 @@ func (t *SpeedTracker) GetLimiter(user string) *rate.Limiter {
 	}
 
 	// Create limiter on-demand
-	bytesPerSec := int(u.SpeedLimit) * 1_000_000 / 8
-	burst := bytesPerSec
-	if burst < 64*1024 {
-		burst = 64 * 1024
-	}
-	if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
-		burst = cap4s
-	}
-
-	lim := rate.NewLimiter(rate.Limit(bytesPerSec), burst)
+	limit, burst := speedLimitToBytesAndBurst(u.SpeedLimit)
+	lim := rate.NewLimiter(limit, burst)
 
 	t.mu.Lock()
-	// Double-check after acquiring write lock
+	// Double-check after acquiring write lock: user may have been removed or
+	// had their limit cleared concurrently by UpdateBuckets.
+	if currentUID, ok := t.uuidMap[user]; !ok || currentUID != uid {
+		t.mu.Unlock()
+		return nil
+	}
 	if existing, ok := t.buckets[uid]; ok {
 		t.mu.Unlock()
 		return existing
@@ -157,4 +158,24 @@ func (t *SpeedTracker) LimitedUserCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.buckets)
+}
+
+func speedLimitToBytesAndBurst(speedLimitMbps int) (rate.Limit, int) {
+	if speedLimitMbps <= 0 {
+		return rate.Inf, 0
+	}
+	// Compute in 64-bit to prevent 32-bit signed integer overflow (e.g. 2500 Mbps * 1_000_000).
+	bytesPerSec := int64(speedLimitMbps) * 1_000_000 / 8
+	burst := bytesPerSec
+	if burst < 64*1024 {
+		burst = 64 * 1024
+	}
+	if cap4s := bytesPerSec * 4; cap4s > 64*1024 && burst > cap4s {
+		burst = cap4s
+	}
+	maxInt := int64(math.MaxInt)
+	if burst > maxInt {
+		burst = maxInt
+	}
+	return rate.Limit(bytesPerSec), int(burst)
 }

@@ -11,7 +11,9 @@ import (
 )
 
 // LoadCustomConfig reads a custom config file (JSON or YAML) and returns it
-// as a generic map. Returns nil if path is empty or file does not exist.
+// as a generic map with all nested YAML maps normalized to map[string]any so
+// encoding/json can always marshal the result.
+// Returns nil if path is empty or file does not exist.
 func LoadCustomConfig(path string) (map[string]any, error) {
 	if path == "" {
 		return nil, nil
@@ -38,8 +40,12 @@ func LoadCustomConfig(path string) (map[string]any, error) {
 			return nil, fmt.Errorf("parse custom config as JSON: %w", err)
 		}
 	} else {
-		if err := yaml.Unmarshal(data, &result); err != nil {
+		var raw any
+		if err := yaml.Unmarshal(data, &raw); err != nil {
 			return nil, fmt.Errorf("parse custom config as YAML: %w", err)
+		}
+		if normalized, ok := normalizeJSONValue(raw).(map[string]any); ok {
+			result = normalized
 		}
 	}
 
@@ -47,23 +53,80 @@ func LoadCustomConfig(path string) (map[string]any, error) {
 	return result, nil
 }
 
-// MergeAppendList appends items from src list into dst, returning the merged list.
-// Each item is converted to map[string]any for JSON-marshal compatibility.
+// normalizeJSONValue recursively converts map[any]any (produced by yaml.v3 for
+// non-string keys) into map[string]any so json.Marshal never fails.
+func normalizeJSONValue(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, item := range val {
+			out[k] = normalizeJSONValue(item)
+		}
+		return out
+	case map[any]any:
+		out := make(map[string]any, len(val))
+		for k, item := range val {
+			out[fmt.Sprint(k)] = normalizeJSONValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, item := range val {
+			out[i] = normalizeJSONValue(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// MergeAppendList appends items from src list into a freshly allocated copy of
+// dst, returning the merged list without mutating caller slice backing arrays.
 func MergeAppendList(dst []map[string]any, srcRaw any) []map[string]any {
 	srcList, ok := toSliceOfMaps(srcRaw)
 	if !ok {
 		return dst
 	}
-	return append(dst, srcList...)
+	out := make([]map[string]any, 0, len(dst)+len(srcList))
+	out = append(out, dst...)
+	out = append(out, srcList...)
+	return out
 }
 
-// MergePrependList prepends items from src list before dst items.
+// MergePrependList prepends items from src list before dst items into a freshly
+// allocated slice without mutating srcRaw's or dst's backing arrays.
 func MergePrependList(dst []map[string]any, srcRaw any) []map[string]any {
 	srcList, ok := toSliceOfMaps(srcRaw)
 	if !ok {
 		return dst
 	}
-	return append(srcList, dst...)
+	out := make([]map[string]any, 0, len(srcList)+len(dst))
+	out = append(out, srcList...)
+	out = append(out, dst...)
+	return out
+}
+
+// CustomConfigOutboundTags extracts exact tag names from top-level "outbounds"
+// and "endpoints" arrays of an already-loaded custom config map.
+func CustomConfigOutboundTags(custom map[string]any) map[string]bool {
+	tags := make(map[string]bool)
+	if custom == nil {
+		return tags
+	}
+	for _, section := range []string{"outbounds", "endpoints"} {
+		items, ok := toSliceOfMaps(custom[section])
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			if tag, ok := item["tag"].(string); ok {
+				if trimmed := strings.TrimSpace(tag); trimmed != "" {
+					tags[trimmed] = true
+				}
+			}
+		}
+	}
+	return tags
 }
 
 func toSliceOfMaps(v any) ([]map[string]any, bool) {
@@ -93,7 +156,7 @@ func toMap(v any) (map[string]any, bool) {
 	case map[any]any:
 		result := make(map[string]any, len(m))
 		for k, val := range m {
-			result[fmt.Sprint(k)] = val
+			result[fmt.Sprint(k)] = normalizeJSONValue(val)
 		}
 		return result, true
 	default:

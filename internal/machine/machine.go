@@ -40,9 +40,10 @@ type Orchestrator struct {
 
 	// Per-node mailbox keyed by node_id. Shared WS events are aggregated here
 	// and each node service drains the latest state when ready.
-	eventsMu  sync.RWMutex
-	mailboxes map[int]*controlplane.NodeMailbox
-	statuses  map[int]chan<- controlplane.StatusChange
+	eventsMu    sync.RWMutex
+	mailboxes   map[int]*controlplane.NodeMailbox
+	statuses    map[int]chan<- controlplane.StatusChange
+	nodeKernels map[int]config.KernelConfig
 
 	// Shared WS client (nil when WS is disabled).
 	ws       *panel.WSClient
@@ -67,6 +68,7 @@ func New(cfg *config.Config) *Orchestrator {
 		nodes:       make(map[int]*nodeHandle),
 		mailboxes:   make(map[int]*controlplane.NodeMailbox),
 		statuses:    make(map[int]chan<- controlplane.StatusChange),
+		nodeKernels: make(map[int]config.KernelConfig),
 		discoveryCh: make(chan struct{}, 1),
 	}
 }
@@ -158,12 +160,15 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 		return
 	}
 
-	var push controlplane.PushClient
-	if o.ws != nil {
-		push = &machineNodePush{
-			nodeID: mn.ID,
-			ws:     o.ws,
-		}
+	// Store the resolved per-node kernel config so onWSEvent validates WS
+	// config pushes against the node's actual kernel (e.g. auto-switched xray).
+	o.eventsMu.Lock()
+	o.nodeKernels[mn.ID] = nodeCfg.Kernel
+	o.eventsMu.Unlock()
+
+	push := &machineNodePush{
+		nodeID: mn.ID,
+		orch:   o,
 	}
 
 	// The registerFn is called by MachinePanelControlPlane.Initial() to expose
@@ -228,6 +233,13 @@ func (o *Orchestrator) stopAll() {
 // ─── Node discovery ──────────────────────────────────────────────────────
 
 func (o *Orchestrator) rediscover(ctx context.Context) {
+	o.mu.Lock()
+	needWS := o.ws == nil && !o.closing
+	o.mu.Unlock()
+	if needWS {
+		o.tryStartWS(ctx)
+	}
+
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		nlog.Core().Warn("machine node discovery failed", "error", err)
@@ -275,9 +287,16 @@ func (o *Orchestrator) reportMachineStatus() {
 // ─── WS mux ─────────────────────────────────────────────────────────────
 
 func (o *Orchestrator) tryStartWS(ctx context.Context) {
-	hs, err := o.client.Handshake()
+	o.mu.Lock()
+	if o.ws != nil || o.closing {
+		o.mu.Unlock()
+		return
+	}
+	o.mu.Unlock()
+
+	hs, err := o.client.HandshakeContext(ctx)
 	if err != nil {
-		nlog.Core().Warn("machine ws handshake failed, REST only", "error", err)
+		nlog.Core().Warn("machine ws handshake failed, will retry on discovery tick", "error", err)
 		return
 	}
 	if !hs.WebSocket.Enabled || hs.WebSocket.WSURL == "" {
@@ -293,7 +312,7 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 		MachineID:        o.cfg.Machine.MachineID,
 	}
 
-	o.ws = panel.NewWSClient(
+	wsClient := panel.NewWSClient(
 		hs.WebSocket.WSURL,
 		o.cfg.Machine.Token,
 		0, // no single node_id
@@ -303,10 +322,17 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 		nil, // per-node status is sent via machineNodePush
 	)
 
+	o.mu.Lock()
+	if o.ws != nil || o.closing {
+		o.mu.Unlock()
+		return
+	}
 	wsCtx, wsCancel := context.WithCancel(ctx)
+	o.ws = wsClient
 	o.wsCancel = wsCancel
-	go o.ws.Run(wsCtx)
+	o.mu.Unlock()
 
+	go wsClient.Run(wsCtx)
 	nlog.Core().Info("machine: ws mux started")
 }
 
@@ -329,18 +355,22 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 		return
 	}
 
-	translated, err := controlplane.TranslateWSEvent(event, o.cfg.Kernel)
-	if err != nil {
-		nlog.Core().Warn("machine ws event translation failed",
-			"type", event.Type, "node_id", nodeID, "error", err)
-		return
-	}
-
 	o.eventsMu.RLock()
 	mailbox, ok := o.mailboxes[nodeID]
+	kcfg, hasKernel := o.nodeKernels[nodeID]
 	o.eventsMu.RUnlock()
 	if !ok {
 		nlog.Core().Debug("machine ws event for unknown node", "node_id", nodeID, "type", event.Type)
+		return
+	}
+	if !hasKernel {
+		kcfg = o.cfg.Kernel
+	}
+
+	translated, err := controlplane.TranslateWSEvent(event, kcfg)
+	if err != nil {
+		nlog.Core().Warn("machine ws event translation failed",
+			"type", event.Type, "node_id", nodeID, "error", err)
 		return
 	}
 	mailbox.Apply(translated)
@@ -372,6 +402,7 @@ func (o *Orchestrator) finishNode(nodeID int, h *nodeHandle) {
 		o.eventsMu.Lock()
 		delete(o.mailboxes, nodeID)
 		delete(o.statuses, nodeID)
+		delete(o.nodeKernels, nodeID)
 		o.eventsMu.Unlock()
 		delete(o.nodes, nodeID)
 	}
@@ -398,7 +429,7 @@ func (o *Orchestrator) applyIntervals(bc panel.MachineBaseConfig) {
 // connectivity status and send capabilities.
 type machineNodePush struct {
 	nodeID int
-	ws     *panel.WSClient
+	orch   *Orchestrator
 }
 
 func (p *machineNodePush) Run(ctx context.Context) {
@@ -407,11 +438,23 @@ func (p *machineNodePush) Run(ctx context.Context) {
 }
 
 func (p *machineNodePush) IsConnected() bool {
-	return p.ws != nil && p.ws.IsConnected()
+	if p.orch == nil {
+		return false
+	}
+	p.orch.mu.Lock()
+	ws := p.orch.ws
+	p.orch.mu.Unlock()
+	return ws != nil && ws.IsConnected()
 }
 
 func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
-	if p.ws == nil {
+	if p.orch == nil {
+		return
+	}
+	p.orch.mu.Lock()
+	ws := p.orch.ws
+	p.orch.mu.Unlock()
+	if ws == nil {
 		return
 	}
 	payload := map[string]interface{}{
@@ -424,5 +467,5 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 	}
 	payload["devices"] = strDevices
 	data, _ := json.Marshal(payload)
-	p.ws.SendRaw(panel.WSEventReportDevices, data)
+	ws.SendRaw(panel.WSEventReportDevices, data)
 }

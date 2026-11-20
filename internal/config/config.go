@@ -509,11 +509,11 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.Kernel.CustomConfig == "" {
 		c.Kernel.CustomConfig = parent.Kernel.CustomConfig
 	}
-	if len(c.Kernel.CustomOutbound) == 0 {
-		c.Kernel.CustomOutbound = parent.Kernel.CustomOutbound
+	if len(c.Kernel.CustomOutbound) == 0 && len(parent.Kernel.CustomOutbound) > 0 {
+		c.Kernel.CustomOutbound = cloneSliceOfMaps(parent.Kernel.CustomOutbound)
 	}
-	if len(c.Kernel.CustomRoute) == 0 {
-		c.Kernel.CustomRoute = parent.Kernel.CustomRoute
+	if len(c.Kernel.CustomRoute) == 0 && len(parent.Kernel.CustomRoute) > 0 {
+		c.Kernel.CustomRoute = cloneSliceOfMaps(parent.Kernel.CustomRoute)
 	}
 	// Cert (NOT cert_dir — derived from config_dir later)
 	if c.Cert.CertMode == "" {
@@ -534,8 +534,8 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.Cert.DNSProvider == "" {
 		c.Cert.DNSProvider = parent.Cert.DNSProvider
 	}
-	if len(c.Cert.DNSEnv) == 0 {
-		c.Cert.DNSEnv = parent.Cert.DNSEnv
+	if len(c.Cert.DNSEnv) == 0 && parent.Cert.DNSEnv != nil {
+		c.Cert.DNSEnv = cloneStringMap(parent.Cert.DNSEnv)
 	}
 	if c.Cert.HTTPPort == 0 {
 		c.Cert.HTTPPort = parent.Cert.HTTPPort
@@ -545,6 +545,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Cert.KeyContent == "" {
 		c.Cert.KeyContent = parent.Cert.KeyContent
+	}
+	if c.Cert.ACMEStorageDir == "" {
+		c.Cert.ACMEStorageDir = parent.Cert.ACMEStorageDir
 	}
 	// Only inherit AutoTLS when the child has no explicit cert configuration.
 	// A child with cert_mode, cert_file, or cert_content explicitly chooses
@@ -556,8 +559,11 @@ func (c *Config) inheritFrom(parent *Config) {
 }
 
 func (c *Config) setDefaultsFrom(baseDir string) {
-	if c.Kernel.Type == "" {
+	switch strings.ToLower(strings.TrimSpace(c.Kernel.Type)) {
+	case "singbox", "sing-box", "":
 		c.Kernel.Type = "singbox"
+	case "xray", "xray-core":
+		c.Kernel.Type = "xray"
 	}
 	if c.Kernel.ConfigDir == "" {
 		c.Kernel.ConfigDir = baseDir
@@ -616,6 +622,9 @@ func (c *Config) AutoInstanceID() (string, error) {
 	if c.IsStandalone() {
 		mode = "standalone"
 		target = "local"
+		if proto := strings.ToLower(strings.TrimSpace(c.Standalone.Node.Protocol)); proto != "" && c.Standalone.Node.ServerPort > 0 {
+			target = fmt.Sprintf("%s-%d", proto, c.Standalone.Node.ServerPort)
+		}
 		baseURL = "standalone"
 	} else if c.IsMachineMode() {
 		mode = "machine"
@@ -627,7 +636,7 @@ func (c *Config) AutoInstanceID() (string, error) {
 			ids[i] = strconv.Itoa(n.NodeID)
 		}
 		sort.Strings(ids)
-		target = strings.Join(ids, ",")
+		target = strings.Join(ids, "_")
 	} else {
 		target = strconv.Itoa(c.Panel.NodeID)
 	}
@@ -721,8 +730,11 @@ func (c *Config) validate() error {
 			}
 		}
 	}
-	switch c.Kernel.Type {
-	case "singbox", "xray":
+	switch strings.ToLower(strings.TrimSpace(c.Kernel.Type)) {
+	case "singbox", "sing-box":
+		c.Kernel.Type = "singbox"
+	case "xray", "xray-core":
+		c.Kernel.Type = "xray"
 	default:
 		return fmt.Errorf("kernel.type must be 'singbox' or 'xray', got '%s'", c.Kernel.Type)
 	}
@@ -734,6 +746,27 @@ func (c *Config) validate() error {
 	}
 	if c.Node.PullInterval < 0 {
 		return fmt.Errorf("node.pull_interval must not be negative")
+	}
+	if c.Node.TrackInterval < 0 {
+		return fmt.Errorf("node.track_interval must not be negative")
+	}
+	if c.Node.DeviceReportInterval < 0 {
+		return fmt.Errorf("node.device_report_interval must not be negative")
+	}
+	if c.WS.StatusInterval < 0 {
+		return fmt.Errorf("ws.status_interval must not be negative")
+	}
+	if c.WS.HandshakeTimeout < 0 {
+		return fmt.Errorf("ws.handshake_timeout must not be negative")
+	}
+	if c.WS.BackoffInitial < 0 {
+		return fmt.Errorf("ws.backoff_initial must not be negative")
+	}
+	if c.WS.BackoffMax < 0 {
+		return fmt.Errorf("ws.backoff_max must not be negative")
+	}
+	if c.WS.DiscoveryInterval < 0 {
+		return fmt.Errorf("ws.discovery_interval must not be negative")
 	}
 	return nil
 }
@@ -754,16 +787,22 @@ func (c *Config) ExpandNodes() []*Config {
 		nodeCfg.Panel.NodeID = entry.NodeID
 		nodeCfg.Panel.NodeType = entry.NodeType
 
-		// Per-node kernel overrides
-		if entry.Kernel != nil {
-			if entry.Kernel.ConfigDir != "" {
-				nodeCfg.Kernel.ConfigDir = entry.Kernel.ConfigDir
-				if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
-					// GeoDataDir was defaulted to ConfigDir — keep it pointing at
-					// the new ConfigDir unless the user set it explicitly.
-					nodeCfg.Kernel.GeoDataDir = entry.Kernel.ConfigDir
-				}
+		// Always isolate per-node config_dir unless explicitly overridden by entry.Kernel.ConfigDir.
+		if entry.Kernel != nil && entry.Kernel.ConfigDir != "" {
+			nodeCfg.Kernel.ConfigDir = entry.Kernel.ConfigDir
+			if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
+				nodeCfg.Kernel.GeoDataDir = entry.Kernel.ConfigDir
 			}
+		} else {
+			nodeCfg.Kernel.ConfigDir = filepath.Join(c.Kernel.ConfigDir, fmt.Sprintf("node-%d", entry.NodeID))
+			if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
+				// Share the geo data dir with the base dir to avoid re-downloading.
+				nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
+			}
+		}
+
+		// Per-node kernel field overrides
+		if entry.Kernel != nil {
 			if entry.Kernel.GeoDataDir != "" {
 				nodeCfg.Kernel.GeoDataDir = entry.Kernel.GeoDataDir
 			}
@@ -773,26 +812,73 @@ func (c *Config) ExpandNodes() []*Config {
 			if entry.Kernel.CustomConfig != "" {
 				nodeCfg.Kernel.CustomConfig = entry.Kernel.CustomConfig
 			}
-		} else {
-			// Auto-derive a unique config_dir per node to avoid conflicts.
-			nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, entry.NodeID)
-			if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
-				// Share the geo data dir with the base dir to avoid re-downloading.
-				nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
-			}
 		}
 
-		// Per-node cert overrides
+		// Per-node cert overrides: merge non-zero fields over inherited Cert
+		// and isolate per-node CertDir unless explicitly specified.
 		if entry.Cert != nil {
-			nodeCfg.Cert = *entry.Cert
+			mergeCertOverride(&nodeCfg.Cert, entry.Cert)
+		} else if c.Cert.DNSEnv != nil {
+			nodeCfg.Cert.DNSEnv = cloneStringMap(c.Cert.DNSEnv)
 		}
-		if nodeCfg.Cert.CertDir == "" {
+		if len(c.Kernel.CustomOutbound) > 0 {
+			nodeCfg.Kernel.CustomOutbound = cloneSliceOfMaps(c.Kernel.CustomOutbound)
+		}
+		if len(c.Kernel.CustomRoute) > 0 {
+			nodeCfg.Kernel.CustomRoute = cloneSliceOfMaps(c.Kernel.CustomRoute)
+		}
+		if entry.Cert == nil || entry.Cert.CertDir == "" {
 			nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
+		}
+		if nodeCfg.Cert.ACMEStorageDir == "" {
+			nodeCfg.Cert.ACMEStorageDir = filepath.Join(c.Kernel.ConfigDir, "acme-shared")
 		}
 
 		result = append(result, &nodeCfg)
 	}
 	return result
+}
+
+func mergeCertOverride(dst, override *CertConfig) {
+	if override.CertMode != "" {
+		dst.CertMode = override.CertMode
+	}
+	if override.Domain != "" {
+		dst.Domain = override.Domain
+	}
+	if override.Email != "" {
+		dst.Email = override.Email
+	}
+	if override.CertFile != "" {
+		dst.CertFile = override.CertFile
+	}
+	if override.KeyFile != "" {
+		dst.KeyFile = override.KeyFile
+	}
+	if override.CertDir != "" {
+		dst.CertDir = override.CertDir
+	}
+	if override.ACMEStorageDir != "" {
+		dst.ACMEStorageDir = override.ACMEStorageDir
+	}
+	if override.HTTPPort != 0 {
+		dst.HTTPPort = override.HTTPPort
+	}
+	if override.DNSProvider != "" {
+		dst.DNSProvider = override.DNSProvider
+	}
+	if len(override.DNSEnv) > 0 {
+		dst.DNSEnv = cloneStringMap(override.DNSEnv)
+	}
+	if override.CertContent != "" {
+		dst.CertContent = override.CertContent
+	}
+	if override.KeyContent != "" {
+		dst.KeyContent = override.KeyContent
+	}
+	if override.AutoTLS {
+		dst.AutoTLS = true
+	}
 }
 
 func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
@@ -803,9 +889,18 @@ func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 	nodeCfg.Panel.Token = c.Machine.Token
 	nodeCfg.Panel.MachineID = c.Machine.MachineID
 
-	nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, nodeID)
+	nodeCfg.Kernel.ConfigDir = filepath.Join(c.Kernel.ConfigDir, fmt.Sprintf("node-%d", nodeID))
 	if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
 		nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
+	}
+	if c.Cert.DNSEnv != nil {
+		nodeCfg.Cert.DNSEnv = cloneStringMap(c.Cert.DNSEnv)
+	}
+	if len(c.Kernel.CustomOutbound) > 0 {
+		nodeCfg.Kernel.CustomOutbound = cloneSliceOfMaps(c.Kernel.CustomOutbound)
+	}
+	if len(c.Kernel.CustomRoute) > 0 {
+		nodeCfg.Kernel.CustomRoute = cloneSliceOfMaps(c.Kernel.CustomRoute)
 	}
 	nodeCfg.Cert.CertDir = filepath.Join(nodeCfg.Kernel.ConfigDir, "certs")
 	if nodeCfg.Cert.ACMEStorageDir == "" {
@@ -813,6 +908,35 @@ func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 	}
 
 	return &nodeCfg
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneSliceOfMaps(src []map[string]any) []map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make([]map[string]any, len(src))
+	for i, m := range src {
+		if m == nil {
+			continue
+		}
+		item := make(map[string]any, len(m))
+		for k, v := range m {
+			item[k] = v
+		}
+		dst[i] = item
+	}
+	return dst
 }
 
 func InitLogger(cfg LogConfig) {
@@ -856,7 +980,10 @@ func InitLogger(cfg LogConfig) {
 		}
 	}
 
-	nlog.Init(w, minLevel, useColor)
+	prev := nlog.Init(w, minLevel, useColor)
+	if prevFile, ok := prev.(*os.File); ok && prevFile != os.Stdout && prevFile != os.Stderr {
+		_ = prevFile.Close()
+	}
 	// Application logging goes through nlog; silence slog.Default for stray library use.
 	slog.SetDefault(slog.New(slog.DiscardHandler))
 }
@@ -884,9 +1011,9 @@ func ValidateStartupLayout(instances []*Config) error {
 			}
 			configDirs[dir] = owner
 		}
-		// Machine mode discovers nodes dynamically — skip static binding check,
-		// but still validate custom_config if set at the instance level.
-		if instance.IsMachineMode() {
+		// Machine and standalone modes have no static panel node_id binding —
+		// skip panel nodeBindings check, but still validate custom_config.
+		if instance.IsMachineMode() || instance.IsStandalone() {
 			if path := strings.TrimSpace(instance.Kernel.CustomConfig); path != "" {
 				if _, err := os.Stat(path); err != nil {
 					return fmt.Errorf("kernel.custom_config %q for %s: %w", path, owner, err)

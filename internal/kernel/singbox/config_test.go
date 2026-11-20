@@ -735,29 +735,37 @@ func TestBuildRoutes_WithCustomRouteRules(t *testing.T) {
 	}
 	route := buildRoutes(nil, customRules, nil)
 	allRules := route["rules"].([]M)
-	if len(allRules) != 9 {
-		t.Fatalf("rules count: got %d, want 9", len(allRules))
+	// 1 combined custom rule + 2 built-in private IPv4/IPv6 block rules
+	if len(allRules) != 3 {
+		t.Fatalf("rules count: got %d, want 3", len(allRules))
 	}
-	if allRules[0]["domain"].([]string)[0] != "full.example.com" {
-		t.Fatalf("unexpected exact domain rule: %v", allRules[0])
+	r := allRules[0]
+	if r["outbound"] != "direct" {
+		t.Fatalf("unexpected outbound: %v", r["outbound"])
 	}
-	if allRules[1]["domain_suffix"].([]string)[0] != "example.org" {
-		t.Fatalf("unexpected domain suffix rule: %v", allRules[1])
+	if r["domain"].([]string)[0] != "full.example.com" {
+		t.Fatalf("unexpected exact domain rule: %v", r)
 	}
-	if allRules[2]["ip_cidr"].([]string)[0] != "1.1.1.0/24" {
-		t.Fatalf("unexpected ip cidr rule: %v", allRules[2])
+	if r["domain_suffix"].([]string)[0] != "example.org" {
+		t.Fatalf("unexpected domain suffix rule: %v", r)
 	}
-	if allRules[3]["port"].([]int)[0] != 53 {
-		t.Fatalf("unexpected port rule: %v", allRules[3])
+	if r["ip_cidr"].([]string)[0] != "1.1.1.0/24" {
+		t.Fatalf("unexpected ip cidr rule: %v", r)
 	}
-	if allRules[4]["network"].([]string)[0] != "tcp" {
-		t.Fatalf("unexpected network rule: %v", allRules[4])
+	if r["port"].([]int)[0] != 53 {
+		t.Fatalf("unexpected port rule: %v", r)
 	}
-	if allRules[5]["source_ip_cidr"].([]string)[0] != "10.10.0.0/16" {
-		t.Fatalf("unexpected source cidr rule: %v", allRules[5])
+	if r["port_range"].([]string)[0] != "1000:1002" {
+		t.Fatalf("unexpected port range rule: %v", r)
 	}
-	if allRules[6]["source_port_range"].([]string)[0] != "2000:2001" {
-		t.Fatalf("unexpected source port rule: %v", allRules[6])
+	if r["network"].([]string)[0] != "tcp" {
+		t.Fatalf("unexpected network rule: %v", r)
+	}
+	if r["source_ip_cidr"].([]string)[0] != "10.10.0.0/16" {
+		t.Fatalf("unexpected source cidr rule: %v", r)
+	}
+	if r["source_port_range"].([]string)[0] != "2000:2001" {
+		t.Fatalf("unexpected source port rule: %v", r)
 	}
 }
 
@@ -919,5 +927,92 @@ func TestExtractECHInbound(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildConfig_WireGuardEndpointAndDetour(t *testing.T) {
+	nc := &model.NodeSpec{
+		Protocol:   "vless",
+		ListenIP:   "127.0.0.1",
+		ServerPort: 443,
+		CustomOutbounds: []model.OutboundConfig{
+			{
+				Tag:      "warp",
+				Protocol: "wireguard",
+				Settings: map[string]any{
+					"secret_key": "privkey",
+					"peers":      []any{map[string]any{"endpoint": "162.159.195.1:2408"}},
+				},
+			},
+			{
+				Tag:      "us-proxy",
+				Protocol: "socks",
+				Settings: map[string]any{"server": "1.2.3.4", "server_port": 1080},
+				ProxyTag: "warp",
+			},
+		},
+	}
+	cfg := buildConfig(config.KernelConfig{LogLevel: "warn"}, nc, testUsers, kernel.TLSCert{})
+	endpoints, ok := cfg["endpoints"].([]M)
+	if !ok || len(endpoints) != 1 || endpoints[0]["type"] != "wireguard" || endpoints[0]["tag"] != "warp" {
+		t.Fatalf("expected wireguard under endpoints, got %#v", cfg["endpoints"])
+	}
+	outbounds := cfg["outbounds"].([]M)
+	for _, ob := range outbounds {
+		if ob["type"] == "wireguard" {
+			t.Fatalf("wireguard must not be placed in outbounds: %#v", ob)
+		}
+		if ob["tag"] == "us-proxy" {
+			if ob["detour"] != "warp" {
+				t.Fatalf("expected detour=warp, got %#v", ob)
+			}
+			if _, hasBad := ob["proxy_tag"]; hasBad {
+				t.Fatalf("proxy_tag must not appear in sing-box outbound: %#v", ob)
+			}
+		}
+	}
+	inbounds := cfg["inbounds"].([]M)
+	if inbounds[0]["listen"] != "127.0.0.1" {
+		t.Fatalf("expected listen=127.0.0.1, got %v", inbounds[0]["listen"])
+	}
+}
+
+func TestBuildInbound_Hysteria2ProtocolName(t *testing.T) {
+	nc := &model.NodeSpec{
+		Protocol:   "hysteria2",
+		ServerPort: 8443,
+	}
+	inbound := buildInbound(nc, testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+	if inbound == nil {
+		t.Fatal("expected non-nil inbound for hysteria2 protocol")
+	}
+	assertMapValue(t, inbound, "type", "hysteria2")
+}
+
+func TestBuildRoutes_PanelGeoAndBareIPAndDNS(t *testing.T) {
+	panelRoutes := []model.RouteRule{
+		{Match: []string{"geoip:cn", "geosite:category-ads-all", "1.1.1.1"}, Action: "block"},
+		{Match: []string{"dns.example.com"}, Action: "dns"},
+	}
+	route := buildRoutes(panelRoutes, nil, nil)
+	ruleSets, ok := route["rule_set"].([]M)
+	if !ok || len(ruleSets) != 2 {
+		t.Fatalf("expected 2 rule_set entries, got %#v", route["rule_set"])
+	}
+	allRules := route["rules"].([]M)
+	foundIP, foundRS, foundDNS := false, false, false
+	for _, r := range allRules {
+		if cidrs, ok := r["ip_cidr"].([]string); ok && len(cidrs) == 1 && cidrs[0] == "1.1.1.1/32" {
+			foundIP = true
+		}
+		if rs, ok := r["rule_set"].([]string); ok && len(rs) == 2 {
+			foundRS = true
+		}
+		if r["action"] == "hijack-dns" {
+			foundDNS = true
+		}
+	}
+	if !foundIP || !foundRS || !foundDNS {
+		t.Fatalf("missing expected compiled rules: foundIP=%v foundRS=%v foundDNS=%v rules=%#v", foundIP, foundRS, foundDNS, allRules)
 	}
 }

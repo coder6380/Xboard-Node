@@ -234,3 +234,188 @@ func TestACMEFingerprintEnvOrderStable(t *testing.T) {
 		t.Fatal("fingerprint not order-independent")
 	}
 }
+
+func TestReconfigureToNoneClearsMaterialAndReportsChanged(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(config.CertConfig{
+		CertMode: "self",
+		Domain:   "example.com",
+		CertDir:  dir,
+	})
+	ctx := context.Background()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start self: %v", err)
+	}
+	if !mgr.HasCert() {
+		t.Fatal("expected cert after Start(self)")
+	}
+
+	changed, err := mgr.Reconfigure(ctx, config.CertConfig{
+		CertMode: "none",
+		CertDir:  dir,
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure none: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected changed=true when switching from self to none")
+	}
+	if mgr.HasCert() {
+		t.Fatal("expected cert material to be cleared when switching to none")
+	}
+}
+
+func TestSelfSignedRegeneratesOnDomainChange(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(config.CertConfig{
+		CertMode: "self",
+		Domain:   "first.example.com",
+		CertDir:  dir,
+	})
+	ctx := context.Background()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start self: %v", err)
+	}
+	firstTLS := mgr.TLSCert()
+
+	changed, err := mgr.Reconfigure(ctx, config.CertConfig{
+		CertMode: "self",
+		Domain:   "second.example.com",
+		CertDir:  dir,
+	})
+	if err != nil {
+		t.Fatalf("Reconfigure self domain: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected changed=true when self-signed domain changes")
+	}
+	secondTLS := mgr.TLSCert()
+	if pemEqual(firstTLS, secondTLS) {
+		t.Fatal("expected new self-signed cert for new domain, got reused old cert")
+	}
+}
+
+func TestReconfigureFailurePreservesActiveMaterial(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(config.CertConfig{
+		CertMode: "self",
+		Domain:   "keep.example.com",
+		CertDir:  dir,
+	})
+	ctx := context.Background()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start self: %v", err)
+	}
+	origTLS := mgr.TLSCert()
+
+	// Simulate active ACME state that gets torn down before failing Reconfigure.
+	mgr.mu.Lock()
+	mgr.acmeStarted = true
+	mgr.acmeFingerprint = "old-fp"
+	mgr.mu.Unlock()
+
+	changed, err := mgr.Reconfigure(ctx, config.CertConfig{
+		CertMode: "file",
+		CertFile: filepath.Join(dir, "missing.crt"),
+		KeyFile:  filepath.Join(dir, "missing.key"),
+		CertDir:  dir,
+	})
+	if err == nil {
+		t.Fatal("expected error for missing cert file")
+	}
+	if changed {
+		t.Fatal("expected changed=false on failed reconfigure")
+	}
+	if !mgr.HasCert() || !pemEqual(origTLS, mgr.TLSCert()) {
+		t.Fatal("expected active cert material to be preserved after failed reconfigure")
+	}
+}
+
+func TestACMEFingerprintIncludesHTTPPort(t *testing.T) {
+	a := config.CertConfig{CertMode: "http", Domain: "a.example.com", HTTPPort: 80}
+	b := config.CertConfig{CertMode: "http", Domain: "a.example.com", HTTPPort: 0}
+	c := config.CertConfig{CertMode: "http", Domain: "a.example.com", HTTPPort: 8080}
+	if acmeFingerprint(a) != acmeFingerprint(b) {
+		t.Fatal("HTTPPort 0 and 80 should normalize to identical fingerprint")
+	}
+	if acmeFingerprint(a) == acmeFingerprint(c) {
+		t.Fatal("different HTTPPort must produce different acmeFingerprint")
+	}
+}
+
+func TestLoadPEMFromStorage_IDNDomain(t *testing.T) {
+	dir := t.TempDir()
+	storage := &certmagic.FileStorage{Path: dir}
+	const issuerKey = "test-issuer"
+	const idnDomain = "münchen.de"
+	const asciiDomain = "xn--mnchen-3ya.de"
+	ctx := context.Background()
+
+	certPEM, keyPEM := generateSelfSignedPair(t, asciiDomain)
+	if err := storage.Store(ctx, certmagic.StorageKeys.SiteCert(issuerKey, asciiDomain), certPEM); err != nil {
+		t.Fatalf("seed cert: %v", err)
+	}
+	if err := storage.Store(ctx, certmagic.StorageKeys.SitePrivateKey(issuerKey, asciiDomain), keyPEM); err != nil {
+		t.Fatalf("seed key: %v", err)
+	}
+
+	m := NewManager(config.CertConfig{})
+	if err := m.loadPEMFromStorage(ctx, storage, issuerKey, " "+idnDomain+" "); err != nil {
+		t.Fatalf("loadPEMFromStorage(IDN): %v", err)
+	}
+	if !m.HasCert() {
+		t.Fatal("expected cert loaded for IDN domain")
+	}
+}
+
+func TestSharedACMEStorageSyncDetectsPeerRenewal(t *testing.T) {
+	dir := t.TempDir()
+	storage := &certmagic.FileStorage{Path: dir}
+	const issuerKey = "test-issuer"
+	const domain = "shared.example.com"
+	ctx := context.Background()
+
+	cert1, key1 := generateSelfSignedPair(t, domain)
+	cert2, key2 := generateSelfSignedPair(t, domain)
+	if err := storage.Store(ctx, certmagic.StorageKeys.SiteCert(issuerKey, domain), cert1); err != nil {
+		t.Fatalf("seed cert1: %v", err)
+	}
+	if err := storage.Store(ctx, certmagic.StorageKeys.SitePrivateKey(issuerKey, domain), key1); err != nil {
+		t.Fatalf("seed key1: %v", err)
+	}
+
+	m := NewManager(config.CertConfig{ACMEStorageDir: dir, Domain: domain})
+	if err := m.loadPEMFromStorage(ctx, storage, issuerKey, domain); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+	m.mu.Lock()
+	m.acmeStarted = true
+	m.acmeStorageRef = storage
+	m.acmeIssuerKey = issuerKey
+	m.acmeDomain = domain
+	m.mu.Unlock()
+
+	if m.CertRenewed() {
+		t.Fatal("expected CertRenewed=false when storage matches current material")
+	}
+
+	// Peer node renews cert in shared storage.
+	if err := storage.Store(ctx, certmagic.StorageKeys.SiteCert(issuerKey, domain), cert2); err != nil {
+		t.Fatalf("store cert2: %v", err)
+	}
+	if err := storage.Store(ctx, certmagic.StorageKeys.SitePrivateKey(issuerKey, domain), key2); err != nil {
+		t.Fatalf("store key2: %v", err)
+	}
+
+	// Reset sync timestamp to bypass throttle in test.
+	m.mu.Lock()
+	m.lastStorageSync = time.Time{}
+	m.mu.Unlock()
+
+	if !m.CertRenewed() {
+		t.Fatal("expected CertRenewed=true after peer node updated shared storage")
+	}
+	if string(m.TLSCert().CertPEM) != string(cert2) {
+		t.Fatal("expected Manager to load renewed cert from shared storage")
+	}
+}

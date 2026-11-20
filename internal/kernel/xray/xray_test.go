@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -69,10 +68,8 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 	ld.mu.Lock()
 	ld.limitedIPs[email1] = map[string]int{"1.1.1.1": 1}
 	ld.mu.Unlock()
-	ref := &atomic.Int64{}
-	ref.Store(1)
 	ic := &ipCounter{}
-	ic.ips.Store("2.2.2.2", ref)
+	ic.add("2.2.2.2")
 	ld.unlimitedIPs.Store(email2, ic)
 	ld.connCount.Store(7)
 

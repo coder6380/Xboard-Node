@@ -131,3 +131,14 @@ func cloneStringSlice(src []string) []string {
 	copy(out, src)
 	return out
 }
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}

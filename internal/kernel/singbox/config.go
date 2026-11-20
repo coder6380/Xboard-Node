@@ -20,24 +20,46 @@ type M = map[string]interface{}
 
 func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	var outbounds []M
+	var endpoints []M
 	tags := make(map[string]bool)
 
-	// Panel-defined custom outbounds (structured, converted to sing-box native)
+	customCfg, err := kernel.LoadCustomConfig(kcfg.CustomConfig)
+	if err != nil {
+		nlog.Core().Error("failed to load custom sing-box config", "error", err)
+	}
+	for tag := range kernel.CustomConfigOutboundTags(customCfg) {
+		tags[tag] = true
+	}
+
+	// Panel-defined custom outbounds (structured, converted to sing-box native).
+	// WireGuard was removed from sing-box outbounds in 1.13.0 and must be emitted
+	// under top-level "endpoints".
 	for _, co := range nc.CustomOutbounds {
-		outbounds = append(outbounds, outboundConfigToSingbox(co))
-		tags[strings.ToLower(co.Tag)] = true
+		converted := outboundConfigToSingbox(co)
+		if tag := strings.TrimSpace(co.Tag); tag != "" {
+			tags[tag] = true
+		}
+		if strings.EqualFold(strings.TrimSpace(co.Protocol), "wireguard") {
+			endpoints = append(endpoints, converted)
+		} else {
+			outbounds = append(outbounds, converted)
+		}
 	}
 
 	// Static outbounds from local config file
 	for _, co := range kcfg.CustomOutbound {
-		tag, _ := co["tag"].(string)
-		if tag != "" {
-			tags[strings.ToLower(tag)] = true
+		if tag, _ := co["tag"].(string); strings.TrimSpace(tag) != "" {
+			tags[strings.TrimSpace(tag)] = true
 		}
-		outbounds = append(outbounds, M(co))
+		typ, _ := co["type"].(string)
+		if strings.EqualFold(strings.TrimSpace(typ), "wireguard") || strings.EqualFold(strings.TrimSpace(typ), "tailscale") {
+			endpoints = append(endpoints, M(co))
+		} else {
+			outbounds = append(outbounds, M(co))
+		}
 	}
 
-	// Add default outbounds only if not already defined
+	// Add default outbounds only if exact lowercase "direct"/"block" is not already defined
 	if !tags["direct"] {
 		outbounds = append([]M{{"type": "direct", "tag": "direct"}}, outbounds...)
 	}
@@ -51,6 +73,9 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 			"timestamp": true,
 		},
 		"outbounds": outbounds,
+	}
+	if len(endpoints) > 0 {
+		cfg["endpoints"] = endpoints
 	}
 
 	inbound := buildInbound(nc, users, tc)
@@ -73,7 +98,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		}
 	}
 
-	mergeCustomSingbox(cfg, kcfg)
+	mergeCustomSingboxMap(cfg, customCfg)
 	return cfg
 }
 
@@ -81,14 +106,15 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 // into a sing-box outbound object. sing-box uses a flat layout where all
 // protocol-specific fields sit at the top level alongside "type" and "tag".
 func outboundConfigToSingbox(oc model.OutboundConfig) M {
+	proto := strings.ToLower(strings.TrimSpace(oc.Protocol))
 	m := M{
-		"type": oc.Protocol,
-		"tag":  oc.Tag,
+		"type": proto,
+		"tag":  strings.TrimSpace(oc.Tag),
 	}
 
 	// Transform common protocol keys to sing-box native format
 	// WireGuard: secret_key -> private_key; peers: endpoint -> address+port
-	if oc.Protocol == "wireguard" {
+	if proto == "wireguard" {
 		if sk, ok := oc.Settings["secret_key"]; ok {
 			m["private_key"] = sk
 		}
@@ -135,7 +161,7 @@ func outboundConfigToSingbox(oc model.OutboundConfig) M {
 	}
 
 	if oc.ProxyTag != "" {
-		m["proxy_tag"] = oc.ProxyTag
+		m["detour"] = oc.ProxyTag
 	}
 	return m
 }
@@ -233,13 +259,37 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 
 func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any) M {
 	var rules []M
+	ruleSetTags := map[string]struct{}{}
+	var ruleSets []M
+
+	addRuleSet := func(kind, code string) string {
+		code = strings.ToLower(strings.TrimSpace(code))
+		if code == "" {
+			return ""
+		}
+		tag := kind + "-" + code
+		if _, exists := ruleSetTags[tag]; !exists {
+			ruleSetTags[tag] = struct{}{}
+			repo := "sing-geoip"
+			if kind == "geosite" {
+				repo = "sing-geosite"
+			}
+			ruleSets = append(ruleSets, M{
+				"tag":    tag,
+				"type":   "remote",
+				"format": "binary",
+				"url":    fmt.Sprintf("https://raw.githubusercontent.com/SagerNet/%s/rule-set/%s.srs", repo, tag),
+			})
+		}
+		return tag
+	}
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
 	for _, rule := range customRules {
 		if rule.Disabled {
 			continue
 		}
-		rules = append(rules, compileCustomRouteRule(rule)...)
+		rules = append(rules, compileCustomRouteRuleWithRuleSets(rule, addRuleSet)...)
 	}
 
 	// Raw custom routes remain the escape hatch, but no longer outrank structured rules.
@@ -273,24 +323,40 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 	)
 
 	for _, pr := range panelRoutes {
-		rules = append(rules, compilePanelRouteRule(pr)...)
+		rules = append(rules, compilePanelRouteRule(pr, addRuleSet)...)
 	}
 
-	return M{
+	route := M{
 		"final": "direct",
 		"rules": rules,
 	}
+	if len(ruleSets) > 0 {
+		route["rule_set"] = ruleSets
+	}
+	return route
 }
 
-func compilePanelRouteRule(pr model.RouteRule) []M {
+func compilePanelRouteRule(pr model.RouteRule, addRuleSet func(kind, code string) string) []M {
 	if len(pr.Match) == 0 {
 		return nil
 	}
 
-	var domains, cidrs []string
+	var domains, cidrs, ruleSets []string
 	for _, item := range pr.Match {
 		item = strings.TrimSpace(item)
 		if item == "" {
+			continue
+		}
+		if strings.HasPrefix(item, "geoip:") {
+			if tag := addRuleSet("geoip", strings.TrimPrefix(item, "geoip:")); tag != "" {
+				ruleSets = append(ruleSets, tag)
+			}
+			continue
+		}
+		if strings.HasPrefix(item, "geosite:") {
+			if tag := addRuleSet("geosite", strings.TrimPrefix(item, "geosite:")); tag != "" {
+				ruleSets = append(ruleSets, tag)
+			}
 			continue
 		}
 		item = strings.TrimPrefix(item, "*.")
@@ -298,111 +364,261 @@ func compilePanelRouteRule(pr model.RouteRule) []M {
 			cidrs = append(cidrs, item)
 			continue
 		}
+		if ip := net.ParseIP(item); ip != nil {
+			if ip.To4() != nil {
+				cidrs = append(cidrs, item+"/32")
+			} else {
+				cidrs = append(cidrs, item+"/128")
+			}
+			continue
+		}
 		domains = append(domains, item)
 	}
 
-	outbound := "block"
-	switch pr.Action {
-	case "direct":
-		outbound = "direct"
-	case "dns":
-		if pr.ActionValue != "" {
-			outbound = pr.ActionValue
-		} else {
-			outbound = "dns-out"
+	applyAction := func(rule M) M {
+		switch pr.Action {
+		case "direct":
+			rule["outbound"] = "direct"
+		case "dns":
+			if pr.ActionValue != "" {
+				rule["outbound"] = pr.ActionValue
+			} else {
+				rule["action"] = "hijack-dns"
+			}
+		case "proxy":
+			if pr.ActionValue != "" {
+				rule["outbound"] = pr.ActionValue
+			} else {
+				rule["outbound"] = "block"
+			}
+		default:
+			rule["outbound"] = "block"
 		}
-	case "proxy":
-		if pr.ActionValue != "" {
-			outbound = pr.ActionValue
-		}
+		return rule
 	}
 
 	var compiled []M
 	if len(domains) > 0 {
-		compiled = append(compiled, M{
+		compiled = append(compiled, applyAction(M{
 			"domain_suffix": copyStrings(domains),
-			"outbound":      outbound,
-		})
+		}))
 	}
 	if len(cidrs) > 0 {
-		compiled = append(compiled, M{
-			"ip_cidr":  copyStrings(cidrs),
-			"outbound": outbound,
-		})
+		compiled = append(compiled, applyAction(M{
+			"ip_cidr": copyStrings(cidrs),
+		}))
+	}
+	if len(ruleSets) > 0 {
+		compiled = append(compiled, applyAction(M{
+			"rule_set": copyStrings(ruleSets),
+		}))
 	}
 	return compiled
 }
 
 func compileCustomRouteRule(rule model.CustomRouteRule) []M {
+	return compileCustomRouteRuleWithRuleSets(rule, nil)
+}
+
+func compileCustomRouteRuleWithRuleSets(rule model.CustomRouteRule, addRuleSet func(kind, code string) string) []M {
 	if rule.Disabled {
 		return nil
 	}
 
 	outbound := singboxOutboundForAction(rule.Action)
+	entry := M{"outbound": outbound}
+	var domains, suffixes, cidrs, destRuleSets []string
+	for _, raw := range rule.Match.Domains {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if addRuleSet != nil && strings.HasPrefix(v, "geosite:") {
+			if tag := addRuleSet("geosite", strings.TrimPrefix(v, "geosite:")); tag != "" {
+				destRuleSets = append(destRuleSets, tag)
+			}
+			continue
+		}
+		domains = append(domains, v)
+	}
+	for _, raw := range rule.Match.DomainSuffixes {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if addRuleSet != nil && strings.HasPrefix(v, "geosite:") {
+			if tag := addRuleSet("geosite", strings.TrimPrefix(v, "geosite:")); tag != "" {
+				destRuleSets = append(destRuleSets, tag)
+			}
+			continue
+		}
+		suffixes = append(suffixes, v)
+	}
+	for _, raw := range rule.Match.IPCIDRs {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if addRuleSet != nil && strings.HasPrefix(v, "geoip:") {
+			if tag := addRuleSet("geoip", strings.TrimPrefix(v, "geoip:")); tag != "" {
+				destRuleSets = append(destRuleSets, tag)
+			}
+			continue
+		}
+		if ip := net.ParseIP(v); ip != nil {
+			if ip.To4() != nil {
+				v += "/32"
+			} else {
+				v += "/128"
+			}
+		}
+		cidrs = append(cidrs, v)
+	}
+
+	var sourceCIDRs, sourceRuleSets []string
+	for _, raw := range rule.Match.SourceCIDRs {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if addRuleSet != nil && strings.HasPrefix(v, "geoip:") {
+			if tag := addRuleSet("geoip", strings.TrimPrefix(v, "geoip:")); tag != "" {
+				sourceRuleSets = append(sourceRuleSets, tag)
+			}
+			continue
+		}
+		if ip := net.ParseIP(v); ip != nil {
+			if ip.To4() != nil {
+				v += "/32"
+			} else {
+				v += "/128"
+			}
+		}
+		sourceCIDRs = append(sourceCIDRs, v)
+	}
+
+	ports, portRanges := splitPorts(rule.Match.Ports)
+	sourcePorts, sourcePortRanges := splitPorts(rule.Match.SourcePorts)
+	networks := kernel.NormalizeNetworks(rule.Match.Networks)
+
+	cloneBase := func(includeSourceCIDRs bool) (M, bool) {
+		e := M{}
+		for k, v := range entry {
+			e[k] = v
+		}
+		hasShared := false
+		if len(ports) > 0 {
+			e["port"] = append([]int(nil), ports...)
+			hasShared = true
+		}
+		if len(portRanges) > 0 {
+			e["port_range"] = copyStrings(portRanges)
+			hasShared = true
+		}
+		if len(networks) > 0 {
+			e["network"] = copyStrings(networks)
+			hasShared = true
+		}
+		if includeSourceCIDRs && len(sourceCIDRs) > 0 {
+			e["source_ip_cidr"] = copyStrings(sourceCIDRs)
+			hasShared = true
+		}
+		if len(sourcePorts) > 0 {
+			e["source_port"] = append([]int(nil), sourcePorts...)
+			hasShared = true
+		}
+		if len(sourcePortRanges) > 0 {
+			e["source_port_range"] = copyStrings(sourcePortRanges)
+			hasShared = true
+		}
+		return e, hasShared
+	}
+
+	hasLiteralDest := len(domains) > 0 || len(suffixes) > 0 || len(cidrs) > 0
 	var compiled []M
 
-	if len(rule.Match.Domains) > 0 {
-		compiled = append(compiled, M{
-			"domain":   copyStrings(rule.Match.Domains),
-			"outbound": outbound,
-		})
-	}
-	if len(rule.Match.DomainSuffixes) > 0 {
-		compiled = append(compiled, M{
-			"domain_suffix": copyStrings(rule.Match.DomainSuffixes),
-			"outbound":      outbound,
-		})
-	}
-	if len(rule.Match.IPCIDRs) > 0 {
-		compiled = append(compiled, M{
-			"ip_cidr":  copyStrings(rule.Match.IPCIDRs),
-			"outbound": outbound,
-		})
-	}
-	if len(rule.Match.Ports) > 0 {
-		ports, portRanges := splitPorts(rule.Match.Ports)
-		entry := M{"outbound": outbound}
-		if len(ports) > 0 {
-			entry["port"] = ports
+	// Sing-box ANDs rule_set with domain/domain_suffix/ip_cidr inside a single
+	// DefaultRule. Emit separate OR rules when both literal destination matchers
+	// and destination rule_set entries are present.
+	emitForDest := func(includeSourceCIDRs bool, extraSourceRuleSets []string) {
+		attachLiteralDest := func(e M) {
+			if len(domains) > 0 {
+				e["domain"] = copyStrings(domains)
+			}
+			if len(suffixes) > 0 {
+				e["domain_suffix"] = copyStrings(suffixes)
+			}
+			if len(cidrs) > 0 {
+				e["ip_cidr"] = copyStrings(cidrs)
+			}
 		}
-		if len(portRanges) > 0 {
-			entry["port_range"] = portRanges
+		if hasLiteralDest {
+			e, _ := cloneBase(includeSourceCIDRs)
+			attachLiteralDest(e)
+			if len(extraSourceRuleSets) > 0 {
+				e["rule_set"] = copyStrings(extraSourceRuleSets)
+				e["rule_set_ip_cidr_match_source"] = true
+			}
+			compiled = append(compiled, e)
 		}
-		compiled = append(compiled, entry)
-	}
-	if len(rule.Match.Networks) > 0 {
-		compiled = append(compiled, M{
-			"network":  copyStrings(rule.Match.Networks),
-			"outbound": outbound,
-		})
-	}
-	if len(rule.Match.SourceCIDRs) > 0 {
-		compiled = append(compiled, M{
-			"source_ip_cidr": copyStrings(rule.Match.SourceCIDRs),
-			"outbound":       outbound,
-		})
-	}
-	if len(rule.Match.SourcePorts) > 0 {
-		ports, portRanges := splitPorts(rule.Match.SourcePorts)
-		entry := M{"outbound": outbound}
-		if len(ports) > 0 {
-			entry["source_port"] = ports
+		if len(destRuleSets) > 0 {
+			if len(extraSourceRuleSets) > 0 {
+				// Combine destination rule_set AND source geoip rule_set via a
+				// sing-box logical AND rule so both constraints must hold simultaneously.
+				destSub, _ := cloneBase(false)
+				delete(destSub, "outbound")
+				delete(destSub, "action")
+				destSub["rule_set"] = copyStrings(destRuleSets)
+				srcSub := M{
+					"rule_set":                      copyStrings(extraSourceRuleSets),
+					"rule_set_ip_cidr_match_source": true,
+				}
+				logical := M{
+					"type":  "logical",
+					"mode":  "and",
+					"rules": []M{destSub, srcSub},
+				}
+				for k, v := range entry {
+					logical[k] = v
+				}
+				compiled = append(compiled, logical)
+			} else {
+				e, _ := cloneBase(includeSourceCIDRs)
+				e["rule_set"] = copyStrings(destRuleSets)
+				compiled = append(compiled, e)
+			}
 		}
-		if len(portRanges) > 0 {
-			entry["source_port_range"] = portRanges
+		if !hasLiteralDest && len(destRuleSets) == 0 {
+			e, hasShared := cloneBase(includeSourceCIDRs)
+			if len(extraSourceRuleSets) > 0 {
+				e["rule_set"] = copyStrings(extraSourceRuleSets)
+				e["rule_set_ip_cidr_match_source"] = true
+				hasShared = true
+			}
+			if hasShared {
+				compiled = append(compiled, e)
+			}
 		}
-		compiled = append(compiled, entry)
+	}
+
+	if len(sourceRuleSets) > 0 {
+		if len(sourceCIDRs) > 0 {
+			emitForDest(true, nil)
+		}
+		emitForDest(false, sourceRuleSets)
+	} else {
+		emitForDest(true, nil)
 	}
 	return compiled
 }
 
 func singboxOutboundForAction(action model.RouteAction) string {
-	switch action.Type {
+	switch strings.ToLower(strings.TrimSpace(action.Type)) {
 	case "direct":
 		return "direct"
 	case "route":
-		if action.Target != "" {
-			return action.Target
+		if target := strings.TrimSpace(action.Target); target != "" {
+			return target
 		}
 		return "block"
 	default:
@@ -411,22 +627,7 @@ func singboxOutboundForAction(action model.RouteAction) string {
 }
 
 func splitPorts(values []string) ([]int, []string) {
-	var ports []int
-	var ranges []string
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		if strings.ContainsAny(value, ":-") {
-			ranges = append(ranges, strings.ReplaceAll(value, "-", ":"))
-			continue
-		}
-		if port, err := strconv.Atoi(value); err == nil {
-			ports = append(ports, port)
-		}
-	}
-	return ports, ranges
+	return kernel.NormalizePortSpecs(values, ":")
 }
 
 func copyStrings(src []string) []string {
@@ -444,6 +645,10 @@ func mergeCustomSingbox(cfg M, kcfg config.KernelConfig) {
 		nlog.Core().Error("failed to load custom sing-box config", "error", err)
 		return
 	}
+	mergeCustomSingboxMap(cfg, custom)
+}
+
+func mergeCustomSingboxMap(cfg M, custom map[string]any) {
 	if custom == nil {
 		return
 	}
@@ -453,9 +658,23 @@ func mergeCustomSingbox(cfg M, kcfg config.KernelConfig) {
 		cfg["dns"] = v
 	}
 
-	// experimental — custom replaces
+	// experimental — deep-merge sub-keys so auto-generated cache_file is preserved
+	// unless explicitly overridden by custom_config.
 	if v, ok := custom["experimental"]; ok {
-		cfg["experimental"] = v
+		if customExp, ok := v.(map[string]any); ok {
+			merged := M{}
+			if existingExp, ok := cfg["experimental"].(M); ok {
+				for k, val := range existingExp {
+					merged[k] = val
+				}
+			}
+			for k, val := range customExp {
+				merged[k] = val
+			}
+			cfg["experimental"] = merged
+		} else {
+			cfg["experimental"] = v
+		}
 	}
 
 	// outbounds — append custom entries
@@ -517,9 +736,13 @@ func mergeCustomSingboxRoute(cfg M, customRoute map[string]any) {
 }
 
 func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+	listenAddr := "::"
+	if nc.ListenIP != "" {
+		listenAddr = nc.ListenIP
+	}
 	base := M{
 		"tag":         nc.Protocol + "-in",
-		"listen":      "::",
+		"listen":      listenAddr,
 		"listen_port": nc.ServerPort,
 	}
 
@@ -532,7 +755,7 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		return buildVLESS(base, nc, users, tc)
 	case "trojan":
 		return buildTrojan(base, nc, users, tc)
-	case "hysteria":
+	case "hysteria", "hysteria2":
 		return buildHysteria(base, nc, users, tc)
 	case "tuic":
 		return buildTUIC(base, nc, users, tc)
@@ -724,7 +947,7 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 }
 
 func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
-	if nc.Version == 2 {
+	if nc.Protocol == "hysteria2" || nc.Version == 2 {
 		base["type"] = "hysteria2"
 
 		userList := make([]M, 0, len(users))
@@ -735,10 +958,17 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 			})
 		}
 		base["users"] = userList
+		if nc.UpMbps > 0 {
+			base["up_mbps"] = nc.UpMbps
+		}
+		if nc.DownMbps > 0 {
+			base["down_mbps"] = nc.DownMbps
+		}
 
-		if nc.Obfs != "" {
+		obfsType := strings.TrimSpace(nc.Obfs)
+		if obfsType != "" && !strings.EqualFold(obfsType, "none") && strings.TrimSpace(nc.ObfsPassword) != "" {
 			base["obfs"] = M{
-				"type":     nc.Obfs,
+				"type":     obfsType,
 				"password": nc.ObfsPassword,
 			}
 		}
@@ -840,10 +1070,15 @@ func buildNaive(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TL
 	}
 	base["users"] = userList
 
-	if nc.TLS == 1 {
+	if tc.HasCert() {
 		if tls := buildTLSConfig(nc, tc); tls != nil {
 			base["tls"] = tls
 		}
+	}
+	// sing-box naive defaults to TCP+UDP(QUIC), and QUIC requires TLS; restrict
+	// to TCP when TLS is not configured so startup does not fail.
+	if _, hasTLS := base["tls"]; !hasTLS {
+		base["network"] = "tcp"
 	}
 	return base
 }
@@ -884,25 +1119,40 @@ func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLS
 }
 
 func applyTransport(base M, nc *model.NodeSpec) {
-	if nc.Network == "" || nc.Network == "tcp" {
+	netType := strings.ToLower(strings.TrimSpace(nc.Network))
+	if netType == "" || netType == "tcp" || netType == "raw" {
 		return
 	}
 
-	transport := M{"type": nc.Network}
+	transport := M{"type": netType}
 
 	if nc.NetworkSettings != nil {
-		switch nc.Network {
+		switch netType {
 		case "ws":
 			if v, ok := nc.NetworkSettings["path"]; ok {
 				transport["path"] = v
 			}
+			var headers M
 			if v, ok := nc.NetworkSettings["headers"]; ok {
-				transport["headers"] = v
+				if hm, ok := v.(map[string]any); ok && len(hm) > 0 {
+					headers = make(M, len(hm)+1)
+					for k, val := range hm {
+						headers[k] = val
+					}
+				}
 			}
 			if v, ok := nc.NetworkSettings["host"]; ok {
-				if transport["headers"] == nil {
-					transport["headers"] = M{"Host": v}
+				if hostStr := strings.TrimSpace(fmt.Sprintf("%v", v)); hostStr != "" {
+					if headers == nil {
+						headers = M{}
+					}
+					if _, hasHost := headers["Host"]; !hasHost {
+						headers["Host"] = hostStr
+					}
 				}
+			}
+			if len(headers) > 0 {
+				transport["headers"] = headers
 			}
 			if v, ok := nc.NetworkSettings["max_early_data"]; ok {
 				transport["max_early_data"] = v
@@ -1019,14 +1269,19 @@ func buildRealityConfig(nc *model.NodeSpec) M {
 	}
 
 	if dest != "" {
-		handshake := M{"server": dest, "server_port": 443}
-		if parts := strings.SplitN(dest, ":", 2); len(parts) == 2 {
-			handshake["server"] = parts[0]
-			if p, err := strconv.Atoi(parts[1]); err == nil {
+		defaultPort := 443
+		if settings.ServerPort > 0 {
+			defaultPort = settings.ServerPort
+		}
+		handshake := M{"server": dest, "server_port": defaultPort}
+		if host, portStr, err := net.SplitHostPort(dest); err == nil {
+			handshake["server"] = host
+			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
 				handshake["server_port"] = p
 			}
-		} else if settings.ServerPort > 0 {
-			handshake["server_port"] = settings.ServerPort
+		} else {
+			// Strip optional brackets on bare IPv6 dest like "[2001:db8::1]".
+			handshake["server"] = strings.Trim(dest, "[]")
 		}
 		reality["handshake"] = handshake
 	}

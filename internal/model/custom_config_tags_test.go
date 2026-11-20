@@ -79,3 +79,24 @@ func TestValidateOutboundTagCollisions_RejectsDuplicateRawSources(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestValidateNodeSpec_RecognizesCustomConfigEndpointTags(t *testing.T) {
+	dir := t.TempDir()
+	customConfigPath := filepath.Join(dir, "custom.json")
+	content := `{"endpoints":[{"type":"wireguard","tag":"warp-ep"}]}`
+	if err := os.WriteFile(customConfigPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write custom config: %v", err)
+	}
+	err := ValidateNodeSpec(&NodeSpec{
+		CustomRouteRules: []CustomRouteRule{{
+			Match:  RouteMatch{DomainSuffixes: []string{"example.com"}},
+			Action: RouteAction{Type: "route", Target: "warp-ep"},
+		}},
+	}, config.KernelConfig{
+		Type:         "singbox",
+		CustomConfig: customConfigPath,
+	})
+	if err != nil {
+		t.Fatalf("expected endpoint tag to be recognized by route validator, got: %v", err)
+	}
+}

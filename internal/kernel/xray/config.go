@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -20,22 +21,31 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	var outbounds []M
 	tags := make(map[string]bool)
 
+	customCfg, err := kernel.LoadCustomConfig(kcfg.CustomConfig)
+	if err != nil {
+		nlog.Core().Error("failed to load custom xray config", "error", err)
+	}
+	for tag := range kernel.CustomConfigOutboundTags(customCfg) {
+		tags[tag] = true
+	}
+
 	// Panel-defined custom outbounds (structured, converted to Xray native)
 	for _, co := range nc.CustomOutbounds {
 		outbounds = append(outbounds, outboundConfigToXray(co))
-		tags[strings.ToLower(co.Tag)] = true
+		if tag := strings.TrimSpace(co.Tag); tag != "" {
+			tags[tag] = true
+		}
 	}
 
 	// Static outbounds from local config file
 	for _, co := range kcfg.CustomOutbound {
-		tag, _ := co["tag"].(string)
-		if tag != "" {
-			tags[strings.ToLower(tag)] = true
+		if tag, _ := co["tag"].(string); strings.TrimSpace(tag) != "" {
+			tags[strings.TrimSpace(tag)] = true
 		}
 		outbounds = append(outbounds, M(co))
 	}
 
-	// Add default outbounds only if not already defined (Issue #1: Panel priority)
+	// Add default outbounds only if exact lowercase "direct"/"block" is not already defined
 	if !tags["direct"] {
 		outbounds = append([]M{{"protocol": "freedom", "tag": "direct"}}, outbounds...)
 	}
@@ -80,7 +90,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	// Merge panel routes and static config routes
 	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
 
-	mergeCustomXray(cfg, kcfg)
+	mergeCustomXrayMap(cfg, customCfg)
 	return cfg
 }
 
@@ -89,14 +99,14 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 // specific fields go inside a "settings" key, and chain proxying uses "proxySettings".
 func outboundConfigToXray(oc model.OutboundConfig) M {
 	m := M{
-		"protocol": oc.Protocol,
-		"tag":      oc.Tag,
+		"protocol": strings.ToLower(strings.TrimSpace(oc.Protocol)),
+		"tag":      strings.TrimSpace(oc.Tag),
 	}
 	if len(oc.Settings) > 0 {
 		m["settings"] = oc.Settings
 	}
-	if oc.ProxyTag != "" {
-		m["proxySettings"] = M{"tag": oc.ProxyTag}
+	if proxyTag := strings.TrimSpace(oc.ProxyTag); proxyTag != "" {
+		m["proxySettings"] = M{"tag": proxyTag}
 	}
 	return m
 }
@@ -121,6 +131,10 @@ func mergeCustomXray(cfg M, kcfg config.KernelConfig) {
 		nlog.Core().Error("failed to load custom xray config", "error", err)
 		return
 	}
+	mergeCustomXrayMap(cfg, custom)
+}
+
+func mergeCustomXrayMap(cfg M, custom map[string]any) {
 	if custom == nil {
 		return
 	}
@@ -227,7 +241,7 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		return buildSocks(base, users)
 	case "http":
 		return buildHTTP(base, nc, users, tc)
-	case "hysteria":
+	case "hysteria", "hysteria2":
 		return buildHysteria(base, nc, users, tc)
 	default:
 		return nil
@@ -298,8 +312,9 @@ func buildTrojan(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.T
 	// we should enable a default TLS config to ensure the inbound can start.
 	ss, _ := base["streamSettings"].(M)
 	if security, ok := ss["security"].(string); !ok || (security != "tls" && security != "reality") {
-		nc.TLS = 1 // Force internal state to trigger TLS build in applyStreamSettings
-		applyStreamSettings(base, nc, tc)
+		ncCopy := *nc
+		ncCopy.TLS = 1 // Force TLS build without mutating caller's NodeSpec
+		applyStreamSettings(base, &ncCopy, tc)
 	}
 
 	return base
@@ -317,6 +332,27 @@ var ss2022Methods = map[string]ss2022Config{
 }
 
 func buildShadowsocks(base M, nc *model.NodeSpec, users []model.UserSpec) M {
+	if _, ok := base["streamSettings"]; !ok {
+		base["streamSettings"] = M{
+			"sockopt": M{
+				"reusePort": true,
+			},
+		}
+	}
+	if nc.GetProxyProtocol() {
+		ss, _ := base["streamSettings"].(M)
+		if ss == nil {
+			ss = M{}
+			base["streamSettings"] = ss
+		}
+		sockopt, _ := ss["sockopt"].(M)
+		if sockopt == nil {
+			sockopt = M{}
+			ss["sockopt"] = sockopt
+		}
+		sockopt["acceptProxyProtocol"] = true
+	}
+
 	ss2022, isSS2022 := ss2022Methods[nc.Cipher]
 
 	clients := make([]M, 0, len(users))
@@ -364,6 +400,13 @@ func buildShadowsocks(base M, nc *model.NodeSpec, users []model.UserSpec) M {
 
 func buildSocks(base M, users []model.UserSpec) M {
 	base["protocol"] = "socks"
+	if _, ok := base["streamSettings"]; !ok {
+		base["streamSettings"] = M{
+			"sockopt": M{
+				"reusePort": true,
+			},
+		}
+	}
 	accounts := make([]M, 0, len(users))
 	for _, u := range users {
 		accounts = append(accounts, M{
@@ -396,16 +439,38 @@ func buildHTTP(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLS
 
 	if nc.TLS == 1 {
 		applyStreamSettings(base, nc, tc)
+	} else {
+		if _, ok := base["streamSettings"]; !ok {
+			base["streamSettings"] = M{
+				"sockopt": M{
+					"reusePort": true,
+				},
+			}
+		}
+		if nc.GetProxyProtocol() {
+			ss, _ := base["streamSettings"].(M)
+			if ss == nil {
+				ss = M{}
+				base["streamSettings"] = ss
+			}
+			sockopt, _ := ss["sockopt"].(M)
+			if sockopt == nil {
+				sockopt = M{}
+				ss["sockopt"] = sockopt
+			}
+			sockopt["acceptProxyProtocol"] = true
+		}
 	}
 	return base
 }
 
 // buildHysteria creates a Hysteria v2 inbound for xray-core.
 func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
-	if nc.Version != 2 {
+	if nc.Protocol != "hysteria2" && nc.Version != 2 {
 		nlog.Core().Warn("xray: only supports hysteria v2, skipping v1 inbound")
 		return nil
 	}
+	base["protocol"] = "hysteria"
 
 	clients := make([]M, 0, len(users))
 	for _, u := range users {
@@ -419,11 +484,12 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 	ss := M{
 		"network": "hysteria",
 		"hysteriaSettings": M{
-			"version":        nc.Version,
+			"version":        2,
 			"udpIdleTimeout": 60,
 		},
 	}
 
+	finalMask := M{}
 	if nc.UpMbps > 0 || nc.DownMbps > 0 {
 		quicParams := M{}
 		if nc.UpMbps > 0 {
@@ -432,9 +498,20 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 		if nc.DownMbps > 0 {
 			quicParams["brutalDown"] = fmt.Sprintf("%d mbps", nc.DownMbps)
 		}
-		ss["finalMask"] = M{
-			"quicParams": quicParams,
+		finalMask["quicParams"] = quicParams
+	}
+	if strings.EqualFold(strings.TrimSpace(nc.Obfs), "salamander") && strings.TrimSpace(nc.ObfsPassword) != "" {
+		finalMask["udp"] = []M{
+			{
+				"type": "salamander",
+				"settings": M{
+					"password": nc.ObfsPassword,
+				},
+			},
 		}
+	}
+	if len(finalMask) > 0 {
+		ss["finalmask"] = finalMask
 	}
 
 	if tc.HasCert() {
@@ -443,16 +520,49 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 			"certificate": []string{string(tc.CertPEM)},
 			"key":         []string{string(tc.KeyPEM)},
 		}
-		ss["tlsSettings"] = M{
+		tlsSettings := M{
 			"certificates": []M{tlsCert},
 			"alpn":         []string{"h3"},
 		}
+		serverName := nc.ServerName
+		if serverName == "" && nc.Host != "" {
+			serverName = nc.Host
+		}
+		if serverName != "" {
+			tlsSettings["serverName"] = serverName
+		}
+		if nc.TLSSettings != nil {
+			if sn, ok := nc.TLSSettings["server_name"]; ok && sn != "" {
+				tlsSettings["serverName"] = sn
+			}
+			if alpn, ok := nc.TLSSettings["alpn"]; ok && alpn != nil {
+				tlsSettings["alpn"] = alpn
+			}
+			if echKeys := extractECHServerKeys(nc.TLSSettings); echKeys != "" {
+				tlsSettings["echServerKeys"] = echKeys
+			}
+		}
+		ss["tlsSettings"] = tlsSettings
 	} else {
 		nlog.Core().Warn("hysteria requires TLS certificate files; configure cert_mode (self, file, http, dns, or content)")
 	}
 
+	if baseSS, ok := base["streamSettings"].(M); ok {
+		if existingSockopt, ok := baseSS["sockopt"].(M); ok && len(existingSockopt) > 0 {
+			sockopt := make(M, len(existingSockopt)+1)
+			for k, v := range existingSockopt {
+				sockopt[k] = v
+			}
+			ss["sockopt"] = sockopt
+		}
+	}
 	if nc.GetProxyProtocol() {
-		ss["sockopt"] = M{"acceptProxyProtocol": true}
+		sockopt, ok := ss["sockopt"].(M)
+		if !ok {
+			sockopt = M{}
+		}
+		sockopt["acceptProxyProtocol"] = true
+		ss["sockopt"] = sockopt
 	}
 
 	base["streamSettings"] = ss
@@ -461,6 +571,15 @@ func buildHysteria(base M, nc *model.NodeSpec, users []model.UserSpec, tc kernel
 
 func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 	ss := M{}
+	if baseSS, ok := base["streamSettings"].(M); ok {
+		if existingSockopt, ok := baseSS["sockopt"].(M); ok && len(existingSockopt) > 0 {
+			sockopt := make(M, len(existingSockopt)+1)
+			for k, v := range existingSockopt {
+				sockopt[k] = v
+			}
+			ss["sockopt"] = sockopt
+		}
+	}
 
 	// Network / transport
 	network := nc.Network
@@ -517,17 +636,7 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 		ss["httpupgradeSettings"] = huSettings
 
 	case "h2", "http":
-		ss["network"] = "h2"
-		h2Settings := M{}
-		if nc.NetworkSettings != nil {
-			if v, ok := nc.NetworkSettings["path"]; ok {
-				h2Settings["path"] = v
-			}
-			if v, ok := nc.NetworkSettings["host"]; ok {
-				h2Settings["host"] = []interface{}{v}
-			}
-		}
-		ss["httpSettings"] = h2Settings
+		nlog.Core().Warn("xray: h2/http transport has been removed from xray-core; use singbox kernel instead", "network", nc.Network)
 
 	case "xhttp", "splithttp":
 		ss["network"] = "xhttp"
@@ -545,10 +654,12 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 			if v, ok := nc.NetworkSettings["extra"]; ok {
 				// PHP sends empty arrays [] instead of {} for empty objects;
 				// xray rejects [] for fields that expect objects (e.g. sockopt, tlsSettings).
-				// Recursively strip empty arrays from the extra map before passing to xray.
+				// Deep-copy and strip empty arrays without mutating nc.NetworkSettings in-place.
 				if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
-					sanitizeEmptyArrays(m)
-					xhttpSettings["extra"] = m
+					sanitized := sanitizeEmptyArrays(m)
+					if len(sanitized) > 0 {
+						xhttpSettings["extra"] = sanitized
+					}
 				}
 			}
 		}
@@ -597,7 +708,7 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 
 	// Proxy Protocol
 	if nc.GetProxyProtocol() {
-		sockopt, ok := base["streamSettings"].(M)["sockopt"].(M)
+		sockopt, ok := ss["sockopt"].(M)
 		if !ok {
 			sockopt = M{}
 		}
@@ -622,6 +733,8 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 		switch v := sid.(type) {
 		case string:
 			reality["shortIds"] = []string{v}
+		case []string:
+			reality["shortIds"] = copyStrings(v)
 		case []interface{}:
 			ids := make([]string, 0, len(v))
 			for _, item := range v {
@@ -631,14 +744,29 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 		}
 	}
 
+	defaultPort := "443"
+	if sp, ok := nc.TLSSettings["server_port"]; ok {
+		if portStr := strings.TrimSpace(fmt.Sprintf("%v", sp)); portStr != "" && portStr != "0" {
+			defaultPort = portStr
+		}
+	}
+
 	if dest, ok := nc.TLSSettings["dest"]; ok {
-		destStr := fmt.Sprintf("%v", dest)
-		reality["dest"] = destStr
+		destStr := strings.TrimSpace(fmt.Sprintf("%v", dest))
+		if destStr != "" {
+			if _, _, err := net.SplitHostPort(destStr); err != nil {
+				destStr = net.JoinHostPort(strings.Trim(destStr, "[]"), defaultPort)
+			}
+			reality["dest"] = destStr
+		}
 	}
 	if sn, ok := nc.TLSSettings["server_name"]; ok {
-		reality["serverNames"] = []string{fmt.Sprintf("%v", sn)}
-		if _, exists := reality["dest"]; !exists {
-			reality["dest"] = fmt.Sprintf("%v:443", sn)
+		snStr := strings.TrimSpace(fmt.Sprintf("%v", sn))
+		if snStr != "" {
+			reality["serverNames"] = []string{snStr}
+			if _, exists := reality["dest"]; !exists {
+				reality["dest"] = net.JoinHostPort(strings.Trim(snStr, "[]"), defaultPort)
+			}
 		}
 	}
 
@@ -699,7 +827,7 @@ func compilePanelRouteRule(rule model.RouteRule) []M {
 		if item == "" {
 			continue
 		}
-		if strings.HasPrefix(item, "geoip:") || strings.Contains(item, "/") {
+		if strings.HasPrefix(item, "geoip:") || strings.Contains(item, "/") || net.ParseIP(item) != nil {
 			match.IPCIDRs = append(match.IPCIDRs, item)
 			continue
 		}
@@ -710,89 +838,120 @@ func compilePanelRouteRule(rule model.RouteRule) []M {
 		match.DomainSuffixes = append(match.DomainSuffixes, strings.TrimPrefix(item, "*."))
 	}
 	action := model.RouteAction{Type: "block"}
-	switch rule.Action {
+	switch strings.ToLower(strings.TrimSpace(rule.Action)) {
 	case "direct":
 		action.Type = "direct"
 	case "proxy":
 		action.Type = "route"
 		action.Target = rule.ActionValue
+	case "dns":
+		if strings.TrimSpace(rule.ActionValue) != "" {
+			action.Type = "route"
+			action.Target = rule.ActionValue
+		} else {
+			action.Type = "direct"
+		}
 	}
 	return compileCustomRouteRule(model.CustomRouteRule{Match: match, Action: action})
 }
 
+func formatXrayExactDomain(value string) string {
+	for _, prefix := range []string{"geosite:", "full:", "domain:", "regexp:", "keyword:"} {
+		if strings.HasPrefix(value, prefix) {
+			return value
+		}
+	}
+	return "full:" + value
+}
+
+func formatXraySuffixDomain(value string) string {
+	for _, prefix := range []string{"geosite:", "full:", "domain:", "regexp:", "keyword:"} {
+		if strings.HasPrefix(value, prefix) {
+			return value
+		}
+	}
+	return "domain:" + value
+}
+
 func compileCustomRouteRule(rule model.CustomRouteRule) []M {
 	outbound := xrayOutboundForAction(rule.Action)
-	var compiled []M
 
-	if len(rule.Match.Domains) > 0 || len(rule.Match.DomainSuffixes) > 0 {
-		domains := make([]string, 0, len(rule.Match.Domains)+len(rule.Match.DomainSuffixes))
-		for _, value := range rule.Match.Domains {
-			value = strings.TrimSpace(value)
-			if value == "" {
-				continue
-			}
-			domains = append(domains, value)
+	var domains []string
+	for _, value := range rule.Match.Domains {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
 		}
-		for _, value := range rule.Match.DomainSuffixes {
-			value = strings.TrimSpace(value)
-			if value == "" {
-				continue
-			}
-			domains = append(domains, "domain:"+value)
+		domains = append(domains, formatXrayExactDomain(value))
+	}
+	for _, value := range rule.Match.DomainSuffixes {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
 		}
-		if len(domains) > 0 {
-			compiled = append(compiled, M{
-				"type":        "field",
-				"domain":      domains,
-				"outboundTag": outbound,
-			})
+		domains = append(domains, formatXraySuffixDomain(value))
+	}
+
+	var ips []string
+	for _, value := range rule.Match.IPCIDRs {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
 		}
+		ips = append(ips, value)
 	}
-	if len(rule.Match.IPCIDRs) > 0 {
-		compiled = append(compiled, M{
+
+	buildBase := func() (M, bool) {
+		entry := M{
 			"type":        "field",
-			"ip":          copyStrings(rule.Match.IPCIDRs),
 			"outboundTag": outbound,
-		})
+		}
+		hasConstraint := false
+		if portSpec := kernel.FormatXrayPortSpecs(rule.Match.Ports); portSpec != "" {
+			entry["port"] = portSpec
+			hasConstraint = true
+		}
+		if nets := kernel.NormalizeNetworks(rule.Match.Networks); len(nets) > 0 {
+			entry["network"] = strings.Join(nets, ",")
+			hasConstraint = true
+		}
+		if srcCIDRs := kernel.TrimNonEmpty(rule.Match.SourceCIDRs); len(srcCIDRs) > 0 {
+			entry["source"] = srcCIDRs
+			hasConstraint = true
+		}
+		if srcPortSpec := kernel.FormatXrayPortSpecs(rule.Match.SourcePorts); srcPortSpec != "" {
+			entry["sourcePort"] = srcPortSpec
+			hasConstraint = true
+		}
+		return entry, hasConstraint
 	}
-	if len(rule.Match.Ports) > 0 {
-		compiled = append(compiled, M{
-			"type":        "field",
-			"port":        strings.Join(rule.Match.Ports, ","),
-			"outboundTag": outbound,
-		})
+
+	var compiled []M
+	if len(domains) > 0 {
+		entry, _ := buildBase()
+		entry["domain"] = domains
+		compiled = append(compiled, entry)
 	}
-	if len(rule.Match.Networks) > 0 {
-		compiled = append(compiled, M{
-			"type":        "field",
-			"network":     strings.Join(rule.Match.Networks, ","),
-			"outboundTag": outbound,
-		})
+	if len(ips) > 0 {
+		entry, _ := buildBase()
+		entry["ip"] = ips
+		compiled = append(compiled, entry)
 	}
-	if len(rule.Match.SourceCIDRs) > 0 {
-		compiled = append(compiled, M{
-			"type":        "field",
-			"source":      copyStrings(rule.Match.SourceCIDRs),
-			"outboundTag": outbound,
-		})
-	}
-	if len(rule.Match.SourcePorts) > 0 {
-		compiled = append(compiled, M{
-			"type":        "field",
-			"sourcePort":  strings.Join(rule.Match.SourcePorts, ","),
-			"outboundTag": outbound,
-		})
+	if len(compiled) == 0 {
+		if entry, ok := buildBase(); ok {
+			compiled = append(compiled, entry)
+		}
 	}
 	return compiled
 }
 
 func xrayOutboundForAction(action model.RouteAction) string {
-	switch action.Type {
+	switch strings.ToLower(strings.TrimSpace(action.Type)) {
 	case "direct":
 		return "direct"
 	case "route":
-		if action.Target != "" {
-			return action.Target
+		if target := strings.TrimSpace(action.Target); target != "" {
+			return target
 		}
 		return "block"
 	default:
@@ -809,20 +968,37 @@ func copyStrings(src []string) []string {
 	return out
 }
 
-// sanitizeEmptyArrays recursively removes empty slices from a map.
+// sanitizeEmptyArrays returns a deep-copied map with empty slices removed.
 // PHP encodes empty objects as [] instead of {}; xray-core rejects []
 // for fields that expect struct types (e.g. sockopt, tlsSettings).
-func sanitizeEmptyArrays(m map[string]interface{}) {
+// It never mutates the caller's map in-place.
+func sanitizeEmptyArrays(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
 	for k, v := range m {
 		switch val := v.(type) {
 		case []interface{}:
 			if len(val) == 0 {
-				delete(m, k)
+				continue
 			}
+			copied := make([]interface{}, len(val))
+			for i, elem := range val {
+				if elemMap, ok := elem.(map[string]interface{}); ok {
+					copied[i] = sanitizeEmptyArrays(elemMap)
+				} else {
+					copied[i] = elem
+				}
+			}
+			out[k] = copied
 		case map[string]interface{}:
-			sanitizeEmptyArrays(val)
+			out[k] = sanitizeEmptyArrays(val)
+		default:
+			out[k] = v
 		}
 	}
+	return out
 }
 
 // extractECHServerKeys extracts the ECH private key from tls_settings.ech

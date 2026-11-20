@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
+	hysteriaAccount "github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	ss2022 "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
@@ -97,7 +99,7 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 func (x *Xray) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
-		"hysteria",
+		"hysteria", "hysteria2", "socks", "http",
 	}
 }
 
@@ -115,10 +117,14 @@ func (x *Xray) Protocols() []string {
 //	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
 //	Phase 5 – RecycleOld: close old in background    (non-blocking)
 func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
-	// ── Phase 1: Build config (no shared state) ─────────────────────────
-	x.ensureGeoData(nodeConfig)
+	// ── Phase 1: Build config (snapshot x.cfg under lock to avoid race with SetLogLevel) ──
+	x.mu.Lock()
+	cfg := x.cfg
+	x.mu.Unlock()
 
-	data, err := marshalConfig(x.cfg, nodeConfig, users, tls)
+	x.ensureGeoData(cfg, nodeConfig)
+
+	data, err := marshalConfig(cfg, nodeConfig, users, tls)
 	if err != nil {
 		return err
 	}
@@ -137,6 +143,16 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 		return fmt.Errorf("create xray: %w", err)
 	}
 
+	// Close inbound listeners on existing instance early so listening port
+	// is immediately released before new instance starts.
+	x.mu.Lock()
+	old := x.instance
+	oldLD := x.limitDispatcher
+	x.mu.Unlock()
+	if old != nil {
+		closeInboundListeners(old)
+	}
+
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	if err := startWithTimeout(inst, startTimeout); err != nil {
 		inst.Close()
@@ -145,8 +161,6 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 
 	// ── Phase 4: Swap old → new (brief kernel lock) ─────────────────────
 	x.mu.Lock()
-	old := x.instance
-	oldLD := x.limitDispatcher
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -196,7 +210,9 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 	return x.Start(nodeConfig, users, tls)
 }
 
-// Stop gracefully shuts down the kernel, draining active connections first.
+// Stop gracefully shuts down the kernel, closing listeners first, draining
+// active connections briefly, and synchronously closing the xray instance so
+// bound ports are released before Stop returns.
 func (x *Xray) Stop() {
 	x.running.Store(false)
 
@@ -207,10 +223,24 @@ func (x *Xray) Stop() {
 	x.limitDispatcher = nil
 	x.mu.Unlock()
 
+	if inst == nil {
+		return
+	}
+	closeInboundListeners(inst)
 	if ld != nil {
 		drainConns(ld, drainTimeout)
 	}
-	closeOld(inst, ld)
+	_ = inst.Close()
+	if ld != nil {
+		ld.ResetConns()
+	}
+}
+
+// SetLogLevel updates the kernel log level used on subsequent Start/Reload.
+func (x *Xray) SetLogLevel(level string) {
+	x.mu.Lock()
+	x.cfg.LogLevel = level
+	x.mu.Unlock()
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -354,6 +384,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	// Update bookkeeping with full merged list (new users + updated properties).
 	x.mu.Lock()
 	x.users = merged
+	x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, merged)
 	x.mu.Unlock()
 	x.updateDispatcherLimits(merged)
 	x.updateBandwidthLimits(merged)
@@ -389,7 +420,12 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		return 0, nil
 	}
 
+	// Drain final traffic for departing users into x.cumTraffic before removing them.
+	_, _ = x.aggregateStats()
+
 	if len(kept) == 0 {
+		x.users = nil
+		x.lastKernelHash = ""
 		x.mu.Unlock()
 		x.Stop()
 		return removed, nil
@@ -415,6 +451,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	x.mu.Lock()
 	x.users = kept
+	x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, kept)
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 	x.updateBandwidthLimits(kept)
@@ -438,11 +475,16 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	if added == 0 && removed == 0 {
 		// Only limits changed — update dispatcher without restart.
 		x.users = users
+		x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, users)
 		x.mu.Unlock()
 		x.updateDispatcherLimits(users)
 		x.updateBandwidthLimits(users)
 		nlog.Core().Info("xray: limits updated, kernel unchanged")
 		return 0, 0, nil
+	}
+
+	if removed > 0 {
+		_, _ = x.aggregateStats()
 	}
 
 	um, umErr := x.getUserManager()
@@ -480,6 +522,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	x.mu.Lock()
 	x.users = users
+	x.lastKernelHash = kernel.ComputeHash(x.nodeConfig, users)
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -582,8 +625,12 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 		}
 
 	case "shadowsocks":
-		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
-			// 2022-blake3 multi-user mode
+		if ssCfg, isSS2022 := ss2022Methods[nc.Cipher]; isSS2022 {
+			// Match buildShadowsocks key derivation: fixed-length raw bytes Base64-encoded.
+			rawBuf := make([]byte, ssCfg.size)
+			copy(rawBuf, u.UUID)
+			mu.Account = &ss2022.MemoryAccount{Key: base64.StdEncoding.EncodeToString(rawBuf)}
+		} else if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
 			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
 		} else {
 			// Traditional SS — build via getCipher path
@@ -594,6 +641,9 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 			}
 			mu.Account = cipherObj
 		}
+
+	case "hysteria", "hysteria2":
+		mu.Account = &hysteriaAccount.MemoryAccount{Auth: u.UUID}
 
 	default:
 		return nil, fmt.Errorf("protocol %q does not support MemoryUser", proto)
@@ -640,15 +690,15 @@ func hexEncode(dst, src []byte) {
 }
 
 // ensureGeoData 按最终生成的路由规则检查并下载所需的 Geo 数据库。
-func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
-	routing := buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, x.cfg.CustomRoute))
-	mergeCustomXray(M{"routing": routing}, x.cfg)
+func (x *Xray) ensureGeoData(cfg config.KernelConfig, nc *model.NodeSpec) {
+	routing := buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, cfg.CustomRoute))
+	mergeCustomXray(M{"routing": routing}, cfg)
 	rules, _ := routing["rules"].([]M)
 	needIP, needSite := kernel.NeedsXrayGeoData(rules)
 	if !needIP && !needSite {
 		return
 	}
-	dir := x.cfg.GeoDataDir
+	dir := cfg.GeoDataDir
 	if err := geodata.Ensure(dir, needIP, needSite, "xray"); err != nil {
 		nlog.Core().Warn("geo database unavailable", "error", err)
 	}
@@ -683,22 +733,31 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 	}
 }
 
+// closeInboundListeners closes all inbound handlers immediately so an old
+// SO_REUSEPORT listener stops accepting new connections right away.
+func closeInboundListeners(inst *xrayCore.Instance) {
+	if inst == nil {
+		return
+	}
+	if im, ok := inst.GetFeature(inbound.ManagerType()).(inbound.Manager); ok {
+		_ = im.Close()
+	}
+}
+
 // closeOld shuts down a previously running instance and its dispatcher.
-// Recycling happens in a background goroutine to prevent the main thread
-// from blocking on slow connection draining, enabling "hitless" reload.
+// Inbound listeners are closed immediately to prevent SO_REUSEPORT from
+// routing new connections to the stale instance, then in-flight connections
+// drain briefly before closing the instance.
 func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 	if inst == nil {
 		return
 	}
+	closeInboundListeners(inst)
 	go func() {
-		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
-		// We use a much longer timeout here than the default Stop() because
-		// it's running in background and doesn't block new user connections.
 		if ld != nil {
-			drainConns(ld, 5*time.Minute)
+			drainConns(ld, drainTimeout)
 		}
-		// 2. Hard close
-		inst.Close()
+		_ = inst.Close()
 		if ld != nil {
 			ld.ResetConns()
 		}
@@ -718,10 +777,12 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 	}
 }
 
-// aggregateStats is a fallback path that reads xray's built-in stats counters
-// when LimitDispatcher is not available. Returns per-user cumulative traffic.
-// Must be called with x.mu held.
+// aggregateStats reads xray's built-in stats counters and returns per-user
+// cumulative traffic. Must be called with x.mu held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
+	if x.instance == nil {
+		return nil, nil
+	}
 	sm := x.instance.GetFeature(stats.ManagerType())
 	if sm == nil {
 		return nil, nil
@@ -731,16 +792,29 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 		return nil, nil
 	}
 
-	traffic := make(map[int][2]int64)
+	if x.cumTraffic == nil {
+		x.cumTraffic = make(map[int][2]int64)
+	}
+
+	drainPair := func(ident string) (int64, int64) {
+		var up, down int64
+		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>uplink", ident)); c != nil {
+			up = c.Set(0)
+		}
+		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>downlink", ident)); c != nil {
+			down = c.Set(0)
+		}
+		return up, down
+	}
+
 	for _, u := range x.users {
 		email := userEmail(u.ID)
-
-		var dUp, dDown int64
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>uplink", email)); c != nil {
-			dUp = c.Set(0)
-		}
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>downlink", email)); c != nil {
-			dDown = c.Set(0)
+		dUp, dDown := drainPair(email)
+		// Xray socks/http inbounds set inbound.User.Email = username (u.UUID).
+		if u.UUID != "" && u.UUID != email {
+			uUp, uDown := drainPair(u.UUID)
+			dUp += uUp
+			dDown += uDown
 		}
 
 		if dUp > 0 || dDown > 0 {
@@ -749,9 +823,12 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 			cum[1] += dDown
 			x.cumTraffic[u.ID] = cum
 		}
+	}
 
-		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
-			traffic[u.ID] = cum
+	traffic := make(map[int][2]int64, len(x.cumTraffic))
+	for uid, cum := range x.cumTraffic {
+		if cum[0] > 0 || cum[1] > 0 {
+			traffic[uid] = cum
 		}
 	}
 	return traffic, nil
@@ -783,11 +860,18 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	for _, u := range users {
 		email := userEmail(u.ID)
 		if fn != nil {
-			bm.SetUserLimiter(email, fn(u.UUID))
+			lim := fn(u.UUID)
+			bm.SetUserLimiter(email, lim)
+			if u.UUID != "" && u.UUID != email {
+				bm.SetUserLimiter(u.UUID, lim)
+			}
 			continue
 		}
 		bps := int64(u.SpeedLimit) * 1_000_000 / 8
 		bm.SetUserLimit(email, bps)
+		if u.UUID != "" && u.UUID != email {
+			bm.SetUserLimit(u.UUID, bps)
+		}
 	}
 }
 

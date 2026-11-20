@@ -54,7 +54,7 @@ func (p *MachinePanelControlPlane) Initial(
 	// In machine mode the orchestrator handles the shared WS handshake, but each
 	// node service still needs one initial REST snapshot so newly discovered nodes
 	// can start immediately instead of waiting for a subsequent WS full-sync.
-	hs, err := p.client.Handshake()
+	hs, err := p.client.HandshakeContext(ctx)
 	if err != nil {
 		nlog.Core().Debug("machine node handshake skipped, using REST", "error", err)
 	}
@@ -65,14 +65,14 @@ func (p *MachinePanelControlPlane) Initial(
 		bootstrap.PullInterval = hs.Settings.PullInterval
 	}
 
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, err := p.client.GetConfigContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config: %w", err)
 	}
 	if configSnapshot == nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config is nil")
 	}
-	users, err := p.client.GetUsers()
+	users, err := p.client.GetUsersContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial users: %w", err)
 	}
@@ -99,7 +99,7 @@ func (p *MachinePanelControlPlane) Initial(
 func (p *MachinePanelControlPlane) ResetETags() { p.client.ResetETags() }
 
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, err := p.client.GetConfigContext(ctx)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
 	}
@@ -110,7 +110,7 @@ func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 			p.client.ResetETags()
 		}
 	}()
-	users, err := p.client.GetUsers()
+	users, err := p.client.GetUsersContext(ctx)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
 	}

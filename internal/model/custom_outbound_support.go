@@ -31,7 +31,6 @@ func OutboundSupportMatrix() map[string]KernelOutboundSupport {
 				"tuic",
 				"hysteria2",
 				"anytls",
-				"naive",
 				"mieru",
 				"direct",
 			},

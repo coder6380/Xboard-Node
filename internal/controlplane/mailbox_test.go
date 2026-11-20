@@ -209,3 +209,41 @@ func TestNodeMailboxDeltaFailedApplyNotifies(t *testing.T) {
 		t.Fatal("expected NeedsReconcile for invalid delta action")
 	}
 }
+
+func TestNodeMailboxResetAndSyncUsersPreventsResurrection(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
+	mb.MarkReady()
+
+	// WS disconnect invalidates baseline; a delta before REST resync must request reconcile.
+	mb.ResetUserBaseline()
+	mb.Apply(Event{
+		Type:        EventSyncUserDelta,
+		DeltaAction: "add",
+		DeltaUsers:  []model.UserSpec{{ID: 4, UUID: "u4"}},
+	})
+	st := mb.DrainIfReady()
+	if !st.NeedsReconcile || st.HasUsers {
+		t.Fatalf("expected NeedsReconcile without resurrecting stale users, got %+v", st)
+	}
+
+	// REST poll updates live users to [u2, u3] and syncs mailbox baseline.
+	mb.SyncUsers([]model.UserSpec{{ID: 2, UUID: "u2"}, {ID: 3, UUID: "u3"}})
+	mb.Apply(Event{
+		Type:        EventSyncUserDelta,
+		DeltaAction: "add",
+		DeltaUsers:  []model.UserSpec{{ID: 4, UUID: "u4"}},
+	})
+	st = mb.DrainIfReady()
+	if st.NeedsReconcile || !st.HasUsers {
+		t.Fatalf("expected clean delta apply after SyncUsers, got %+v", st)
+	}
+	if len(st.Users) != 3 {
+		t.Fatalf("expected [u2, u3, u4], got %+v", st.Users)
+	}
+	for _, u := range st.Users {
+		if u.ID == 1 {
+			t.Fatalf("deleted user 1 was resurrected: %+v", st.Users)
+		}
+	}
+}

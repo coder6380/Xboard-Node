@@ -12,12 +12,15 @@ import (
 
 // TestConfigHealthPortMatchesFirstInstance 验证多实例及旧版配置的端口选择。
 func TestConfigHealthPortMatchesFirstInstance(t *testing.T) {
-	for _, tc := range []struct{ name, config, want string }{
-		{"first-disabled", "health_port: 4444\ninstances:\n  - health_port: 0\n  - health_port: 1234\n", "0\n"},
-		{"first-missing", "health_port: 4444\ninstances:\n  - {}\n  - health_port: 1234\n", "0\n"},
-		{"first-enabled", "instances:\n  - health_port: 4321\n  - health_port: 1234\n", "4321\n"},
-		{"legacy-enabled", "health_port: 5678\n", "5678\n"},
-		{"legacy-disabled", "{}\n", "0\n"},
+	for _, tc := range []struct {
+		name, config, want string
+		flag               string
+	}{
+		{"first-disabled", "health_port: 4444\ninstances:\n  - health_port: 0\n  - health_port: 1234\n", "0\n", "--config"},
+		{"first-missing", "health_port: 4444\ninstances:\n  - {}\n  - health_port: 1234\n", "0\n", "--config="},
+		{"first-enabled", "instances:\n  - health_port: 4321\n  - health_port: 1234\n", "4321\n", "-c"},
+		{"legacy-enabled", "health_port: 5678\n", "5678\n", "-c="},
+		{"legacy-disabled", "{}\n", "0\n", "--config"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.yml")
@@ -30,7 +33,13 @@ func TestConfigHealthPortMatchesFirstInstance(t *testing.T) {
 			}
 			original := os.Stdout
 			os.Stdout = writer
-			err = runConfigHealthPort([]string{"--config", path})
+			var args []string
+			if strings.HasSuffix(tc.flag, "=") {
+				args = []string{tc.flag + path}
+			} else {
+				args = []string{tc.flag, path}
+			}
+			err = runConfigHealthPort(args)
 			os.Stdout = original
 			writer.Close()
 			output, readErr := io.ReadAll(reader)
@@ -158,5 +167,57 @@ func TestMergeCredentialsRejectsNewline(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("unexpected output file: %v", err)
+	}
+}
+
+// TestInstallShParseArgsInlineEquals 验证 install.sh 对 --flag=value 语法的正确解析。
+func TestInstallShParseArgsInlineEquals(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash unavailable")
+	}
+	script, err := os.ReadFile(filepath.Join("..", "..", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ReplaceAll(string(script), "\r\n", "\n")
+	start := strings.Index(text, "parse_args() {")
+	if start < 0 {
+		t.Fatal("parse_args function missing")
+	}
+	end := strings.Index(text[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("parse_args function incomplete")
+	}
+	function := text[start : start+end+2]
+	testScript := `log_error() { printf 'LOG_ERROR: %s\n' "$1" >&2; }
+usage() { :; }
+` + function + `
+ACTION="install"
+parse_args --mode=machine --panel=https://panel.test --token=sec123 --machine-id=42 --kernel=xray --health-port=8080 --gomemlimit=512MiB --gogc=100
+[ "$ACTION" = "install" ] || exit 1
+[ "$MODE" = "machine" ] || exit 2
+[ "$PANEL_URL" = "https://panel.test" ] || exit 3
+[ "$TOKEN" = "sec123" ] || exit 4
+[ "$MACHINE_ID" = "42" ] || exit 5
+[ "$KERNEL_TYPE" = "xray" ] || exit 6
+[ "$HEALTH_PORT" = "8080" ] || exit 7
+[ "$RUNTIME_GOMEMLIMIT" = "512MiB" ] || exit 8
+[ "$RUNTIME_GOGC" = "100" ] || exit 9
+
+ACTION="install"
+parse_args --mode=node --panel=https://panel.node --token=tok456 --node-id=99 --node-type=vmess --kernel=sing-box
+[ "$ACTION" = "install" ] || exit 10
+[ "$MODE" = "node" ] || exit 11
+[ "$PANEL_URL" = "https://panel.node" ] || exit 12
+[ "$TOKEN" = "tok456" ] || exit 13
+[ "$NODE_ID" = "99" ] || exit 14
+[ "$NODE_TYPE" = "vmess" ] || exit 15
+[ "$KERNEL_TYPE" = "singbox" ] || exit 16
+`
+	command := exec.Command(bash, "-s")
+	command.Stdin = strings.NewReader(testScript)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s\nscript was:\n%s", err, output, testScript)
 	}
 }

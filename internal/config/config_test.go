@@ -174,6 +174,31 @@ kernel:
 	}
 }
 
+func TestLoad_KernelTypeAliases(t *testing.T) {
+	for alias, expected := range map[string]string{
+		"xray-core": "xray",
+		"Xray":      "xray",
+		"sing-box":  "singbox",
+		"Sing-Box":  "singbox",
+	} {
+		path := writeTemp(t, fmt.Sprintf(`
+panel:
+  url: "https://example.com"
+  token: "tok"
+  node_id: 1
+kernel:
+  type: %s
+`, alias))
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load with alias %q: %v", alias, err)
+		}
+		if cfg.Kernel.Type != expected {
+			t.Errorf("alias %q: got %q, want %q", alias, cfg.Kernel.Type, expected)
+		}
+	}
+}
+
 func TestLoad_AutoTLS_NoDomain(t *testing.T) {
 	path := writeTemp(t, `
 panel:
@@ -326,7 +351,6 @@ kernel:
 		t.Fatal("expected error for standalone mode without users")
 	}
 }
-
 
 func TestLoadRoot_LegacyConfigNormalizesToSingleInstance(t *testing.T) {
 	path := writeTemp(t, `
@@ -541,5 +565,38 @@ func TestInheritFrom_AutoTLSInheritedWhenChildHasNoCertConfig(t *testing.T) {
 	child.inheritFrom(parent)
 	if !child.Cert.AutoTLS {
 		t.Error("auto_tls should be inherited when child has no cert config")
+	}
+}
+
+func TestInheritFrom_ClonesDNSEnvAndCustomConfigs(t *testing.T) {
+	parent := &Config{
+		Kernel: KernelConfig{
+			CustomOutbound: []map[string]any{{"tag": "parent-out"}},
+			CustomRoute:    []map[string]any{{"tag": "parent-route"}},
+		},
+		Cert: CertConfig{
+			DNSEnv: map[string]string{"CF_API_TOKEN": "token123"},
+		},
+	}
+	child1 := &Config{}
+	child2 := &Config{}
+	child1.inheritFrom(parent)
+	child2.inheritFrom(parent)
+
+	// Mutating child1 must NOT affect parent or child2
+	child1.Cert.DNSEnv["CF_API_TOKEN"] = "mutated"
+	if parent.Cert.DNSEnv["CF_API_TOKEN"] != "token123" {
+		t.Errorf("parent DNSEnv was corrupted by child1 mutation")
+	}
+	if child2.Cert.DNSEnv["CF_API_TOKEN"] != "token123" {
+		t.Errorf("child2 DNSEnv was corrupted by child1 mutation")
+	}
+
+	child1.Kernel.CustomOutbound[0]["tag"] = "mutated-out"
+	if parent.Kernel.CustomOutbound[0]["tag"] != "parent-out" {
+		t.Errorf("parent CustomOutbound was corrupted by child1 mutation")
+	}
+	if child2.Kernel.CustomOutbound[0]["tag"] != "parent-out" {
+		t.Errorf("child2 CustomOutbound was corrupted by child1 mutation")
 	}
 }

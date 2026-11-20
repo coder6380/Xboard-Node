@@ -37,7 +37,7 @@ func (p *PanelControlPlane) SupportsReporting() bool     { return true }
 func (p *PanelControlPlane) SupportsDeviceReports() bool { return true }
 
 func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (Bootstrap, error) {
-	hs, err := p.client.Handshake()
+	hs, err := p.client.HandshakeContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("handshake: %w", err)
 	}
@@ -49,14 +49,14 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	}
 
 	nlog.Core().Info("websocket disabled, using REST API")
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, err := p.client.GetConfigContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial config fetch: %w", err)
 	}
 	if configSnapshot == nil {
 		return Bootstrap{}, fmt.Errorf("initial config is nil")
 	}
-	users, err := p.client.GetUsers()
+	users, err := p.client.GetUsersContext(ctx)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial user fetch: %w", err)
 	}
@@ -72,7 +72,7 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 func (p *PanelControlPlane) ResetETags() { p.client.ResetETags() }
 
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
+	configSnapshot, err := p.client.GetConfigContext(ctx)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config: %w", err)
 	}
@@ -83,7 +83,7 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 			p.client.ResetETags()
 		}
 	}()
-	users, err := p.client.GetUsers()
+	users, err := p.client.GetUsersContext(ctx)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll users: %w", err)
 	}
@@ -101,7 +101,7 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 }
 
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {
-	hs, err := p.client.Handshake()
+	hs, err := p.client.HandshakeContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("handshake: %w", err)
 	}

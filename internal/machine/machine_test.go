@@ -77,3 +77,29 @@ func TestStartNodeAfterShutdownOrCancel(t *testing.T) {
 		t.Fatal("started a node after cancellation")
 	}
 }
+
+func TestOnWSEventUsesPerNodeSwitchedKernel(t *testing.T) {
+	o := New(&config.Config{
+		Machine: &config.MachineConfig{MachineID: 1, Token: "tok"},
+		Kernel:  config.KernelConfig{Type: "singbox"},
+	})
+	mb := controlplane.NewNodeMailbox()
+	mb.MarkReady()
+	o.mailboxes[5] = mb
+	o.nodeKernels[5] = config.KernelConfig{Type: "xray"}
+
+	o.onWSEvent(panel.WSEvent{
+		Type:   panel.WSEventSyncConfig,
+		NodeID: 5,
+		Config: &panel.NodeConfig{
+			Protocol:   "vless",
+			ServerPort: 443,
+			Network:    "xhttp",
+		},
+	})
+
+	state := mb.DrainIfReady()
+	if !state.HasConfig || state.Config == nil || state.Config.Network != "xhttp" {
+		t.Fatalf("expected xhttp config to be delivered using per-node xray kernel, got %+v", state)
+	}
+}

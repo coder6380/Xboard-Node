@@ -16,6 +16,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"gopkg.in/yaml.v3"
@@ -48,32 +49,34 @@ type instanceRow struct {
 }
 
 type fileRootConfig struct {
-	Log       *fileLogConfig     `yaml:"log,omitempty"`
-	Kernel    *fileKernelConfig  `yaml:"kernel,omitempty"`
-	Node      *fileNodeConfig    `yaml:"node,omitempty"`
-	WS        *config.WSConfig   `yaml:"ws,omitempty"`
-	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	Cert      *config.CertConfig `yaml:"cert,omitempty"`
-	Instances []fileInstance     `yaml:"instances,omitempty"`
+	Log        *fileLogConfig     `yaml:"log,omitempty"`
+	Kernel     *fileKernelConfig  `yaml:"kernel,omitempty"`
+	Node       *fileNodeConfig    `yaml:"node,omitempty"`
+	WS         *config.WSConfig   `yaml:"ws,omitempty"`
+	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
+	Cert       *config.CertConfig `yaml:"cert,omitempty"`
+	HealthPort int                `yaml:"health_port,omitempty"`
+	Instances  []fileInstance     `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
-	ID         string             `yaml:"id,omitempty"`
-	Panel      filePanelConfig    `yaml:"panel"`
-	Node       *fileNodeConfig    `yaml:"node,omitempty"`
-	Kernel     fileKernelConfig   `yaml:"kernel"`
-	Log        fileLogConfig      `yaml:"log"`
-	Runtime    *fileRuntimeConfig `yaml:"runtime,omitempty"`
-	HealthPort int                `yaml:"health_port,omitempty"`
-	Machine    *fileMachineConfig `yaml:"machine,omitempty"`
-	Standalone map[string]any     `yaml:"standalone,omitempty"`
-	Cert       *config.CertConfig `yaml:"cert,omitempty"`
-	WS         *config.WSConfig   `yaml:"ws,omitempty"`
-	Nodes      []config.NodeEntry `yaml:"nodes,omitempty"`
+	ID         string                   `yaml:"id,omitempty"`
+	Panel      filePanelConfig          `yaml:"panel"`
+	Node       *fileNodeConfig          `yaml:"node,omitempty"`
+	Kernel     fileKernelConfig         `yaml:"kernel"`
+	Log        fileLogConfig            `yaml:"log"`
+	Runtime    *fileRuntimeConfig       `yaml:"runtime,omitempty"`
+	HealthPort int                      `yaml:"health_port,omitempty"`
+	Machine    *fileMachineConfig       `yaml:"machine,omitempty"`
+	Standalone *config.StandaloneConfig `yaml:"standalone,omitempty"`
+	Cert       *config.CertConfig       `yaml:"cert,omitempty"`
+	WS         *config.WSConfig         `yaml:"ws,omitempty"`
+	Nodes      []config.NodeEntry       `yaml:"nodes,omitempty"`
 }
 
 type filePanelConfig struct {
 	URL      string `yaml:"url"`
+	Token    string `yaml:"token,omitempty"`
 	TokenEnv string `yaml:"token_env,omitempty"`
 	NodeID   int    `yaml:"node_id,omitempty"`
 	NodeType string `yaml:"node_type,omitempty"`
@@ -81,6 +84,7 @@ type filePanelConfig struct {
 
 type fileMachineConfig struct {
 	MachineID int    `yaml:"machine_id"`
+	Token     string `yaml:"token,omitempty"`
 	TokenEnv  string `yaml:"token_env,omitempty"`
 }
 
@@ -165,18 +169,30 @@ func run(args []string) error {
 	case "service":
 		return runService(args[1:])
 	case "logs", "log":
-		return runService([]string{"logs"})
+		return runService(append([]string{"logs"}, args[1:]...))
 	case "health":
 		return runHealth()
 	case "bind":
 		return runBind(args[1:])
 	case "bind-node":
+		if err := ensureRoot("bind-node"); err != nil {
+			return err
+		}
 		return runBind(append([]string{"add-node"}, args[1:]...))
 	case "bind-machine":
+		if err := ensureRoot("bind-machine"); err != nil {
+			return err
+		}
 		return runBind(append([]string{"add-machine"}, args[1:]...))
 	case "unbind-node":
+		if err := ensureRoot("unbind-node"); err != nil {
+			return err
+		}
 		return runBind(append([]string{"remove-node"}, args[1:]...))
 	case "unbind-machine":
+		if err := ensureRoot("unbind-machine"); err != nil {
+			return err
+		}
 		return runBind(append([]string{"remove-machine"}, args[1:]...))
 	case "start", "stop", "restart", "enable", "disable":
 		return runService(args)
@@ -382,9 +398,13 @@ func runUpgrade(args []string) error {
 
 	version := "latest"
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--version" && i+1 < len(args) {
-			version = args[i+1]
+		if (args[i] == "--version" || args[i] == "-v") && i+1 < len(args) {
+			version = strings.TrimSpace(args[i+1])
 			i++
+		} else if strings.HasPrefix(args[i], "--version=") {
+			version = strings.TrimSpace(strings.TrimPrefix(args[i], "--version="))
+		} else if strings.HasPrefix(args[i], "-v=") {
+			version = strings.TrimSpace(strings.TrimPrefix(args[i], "-v="))
 		}
 	}
 
@@ -495,7 +515,12 @@ func runUpgrade(args []string) error {
 	// Update install-meta.json
 	newVer := "unknown"
 	if out, err := exec.Command(defaultBinaryPath, "-v").CombinedOutput(); err == nil {
-		newVer = strings.TrimSpace(string(out))
+		fields := strings.Fields(string(out))
+		if len(fields) >= 2 {
+			newVer = fields[1]
+		} else {
+			newVer = strings.TrimSpace(string(out))
+		}
 	}
 	if root, err := loadWritableRootConfig(defaultConfigPath); err == nil {
 		instances, _ := root.NormalizeInstances()
@@ -645,11 +670,14 @@ func runCommand(name string, args ...string) error {
 
 func parseOutput(args []string) string {
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--output" && i+1 < len(args) {
-			return args[i+1]
+		if (args[i] == "--output" || args[i] == "-o") && i+1 < len(args) {
+			return strings.TrimSpace(args[i+1])
 		}
 		if strings.HasPrefix(args[i], "--output=") {
-			return strings.TrimPrefix(args[i], "--output=")
+			return strings.TrimSpace(strings.TrimPrefix(args[i], "--output="))
+		}
+		if strings.HasPrefix(args[i], "-o=") {
+			return strings.TrimSpace(strings.TrimPrefix(args[i], "-o="))
 		}
 	}
 	return "text"
@@ -659,23 +687,41 @@ func parseRemoveNodeArgs(args []string) (string, int, error) {
 	var panel string
 	var nodeID int
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--panel", "-a", "--api":
-			if i+1 >= len(args) {
-				return "", 0, errors.New("missing value for --panel")
+		arg := args[i]
+		val := ""
+		hasInline := false
+		if eq := strings.IndexByte(arg, '='); eq >= 0 {
+			val = arg[eq+1:]
+			arg = arg[:eq]
+			hasInline = true
+		}
+		nextVal := func(name string) (string, error) {
+			if hasInline {
+				return val, nil
 			}
-			panel = args[i+1]
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("missing value for %s", name)
+			}
 			i++
-		case "--node-id", "-n":
-			if i+1 >= len(args) {
-				return "", 0, errors.New("missing value for --node-id")
-			}
-			var err error
-			nodeID, err = parsePositiveInt(args[i+1], "node-id")
+			return args[i], nil
+		}
+		switch arg {
+		case "--panel", "-a", "--api":
+			v, err := nextVal(arg)
 			if err != nil {
 				return "", 0, err
 			}
-			i++
+			panel = v
+		case "--node-id", "-n":
+			v, err := nextVal(arg)
+			if err != nil {
+				return "", 0, err
+			}
+			var err2 error
+			nodeID, err2 = parsePositiveInt(v, "node-id")
+			if err2 != nil {
+				return "", 0, err2
+			}
 		default:
 			return "", 0, fmt.Errorf("unknown remove-node arg: %s", args[i])
 		}
@@ -690,23 +736,41 @@ func parseRemoveMachineArgs(args []string) (string, int, error) {
 	var panel string
 	var machineID int
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--panel", "-a", "--api":
-			if i+1 >= len(args) {
-				return "", 0, errors.New("missing value for --panel")
+		arg := args[i]
+		val := ""
+		hasInline := false
+		if eq := strings.IndexByte(arg, '='); eq >= 0 {
+			val = arg[eq+1:]
+			arg = arg[:eq]
+			hasInline = true
+		}
+		nextVal := func(name string) (string, error) {
+			if hasInline {
+				return val, nil
 			}
-			panel = args[i+1]
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("missing value for %s", name)
+			}
 			i++
-		case "--machine-id":
-			if i+1 >= len(args) {
-				return "", 0, errors.New("missing value for --machine-id")
-			}
-			var err error
-			machineID, err = parsePositiveInt(args[i+1], "machine-id")
+			return args[i], nil
+		}
+		switch arg {
+		case "--panel", "-a", "--api":
+			v, err := nextVal(arg)
 			if err != nil {
 				return "", 0, err
 			}
-			i++
+			panel = v
+		case "--machine-id":
+			v, err := nextVal(arg)
+			if err != nil {
+				return "", 0, err
+			}
+			var err2 error
+			machineID, err2 = parsePositiveInt(v, "machine-id")
+			if err2 != nil {
+				return "", 0, err2
+			}
 		default:
 			return "", 0, fmt.Errorf("unknown remove-machine arg: %s", args[i])
 		}
@@ -718,8 +782,7 @@ func parseRemoveMachineArgs(args []string) (string, int, error) {
 }
 
 func parsePositiveInt(raw string, field string) (int, error) {
-	var value int
-	_, err := fmt.Sscanf(raw, "%d", &value)
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || value <= 0 {
 		return 0, fmt.Errorf("invalid %s: %s", field, raw)
 	}
@@ -739,24 +802,59 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 	kept := make([]config.Config, 0, len(instances))
 	removed := make([]config.Config, 0, 1)
 	for _, inst := range instances {
-		var matched bool
 		if instanceID != "" {
 			// Match by instance ID
 			id, _ := inst.AutoInstanceID()
-			matched = id == instanceID || inst.InstanceID == instanceID
-		} else {
-			matched = strings.TrimSpace(inst.Panel.URL) == strings.TrimSpace(panelURL)
-			if nodeID > 0 {
-				matched = matched && !inst.IsMachineMode() && inst.Panel.NodeID == nodeID
+			if id == instanceID || inst.InstanceID == instanceID {
+				removed = append(removed, inst)
+				continue
 			}
-			if machineID > 0 {
-				matched = matched && inst.IsMachineMode() && inst.Machine != nil && inst.Machine.MachineID == machineID
-			}
-		}
-		if matched {
-			removed = append(removed, inst)
+			kept = append(kept, inst)
 			continue
 		}
+
+		samePanel := strings.TrimSpace(inst.Panel.URL) == strings.TrimSpace(panelURL)
+		if !samePanel {
+			kept = append(kept, inst)
+			continue
+		}
+
+		if machineID > 0 {
+			if inst.IsMachineMode() && inst.Machine != nil && inst.Machine.MachineID == machineID {
+				removed = append(removed, inst)
+				continue
+			}
+			kept = append(kept, inst)
+			continue
+		}
+
+		if nodeID > 0 && !inst.IsMachineMode() {
+			if len(inst.Nodes) > 0 {
+				var remainingNodes []config.NodeEntry
+				var foundNode bool
+				for _, entry := range inst.Nodes {
+					if entry.NodeID == nodeID {
+						foundNode = true
+					} else {
+						remainingNodes = append(remainingNodes, entry)
+					}
+				}
+				if foundNode {
+					removedEntryCfg := inst
+					removedEntryCfg.Panel.NodeID = nodeID
+					removed = append(removed, removedEntryCfg)
+					if len(remainingNodes) > 0 {
+						inst.Nodes = remainingNodes
+						kept = append(kept, inst)
+					}
+					continue
+				}
+			} else if inst.Panel.NodeID == nodeID {
+				removed = append(removed, inst)
+				continue
+			}
+		}
+
 		kept = append(kept, inst)
 	}
 	if len(removed) == 0 {
@@ -769,12 +867,17 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		return fmt.Errorf("binding not found: panel=%s machine_id=%d", panelURL, machineID)
 	}
 	if len(kept) == 0 {
-		// Last binding removed — stop the service to prevent crash-loop
+		// Last binding removed — clear legacy top-level binding too so
+		// writeRootConfig / writeInstallMeta do not resurrect it.
 		root.Instances = nil
+		root.Config.Panel = config.PanelConfig{}
+		root.Config.Machine = nil
+		root.Config.Nodes = nil
+		root.Config.Standalone = nil
 		if err := writeRootConfig(defaultConfigPath, root); err != nil {
 			return err
 		}
-		if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
+		if err := pruneCredentialKeys(defaultCredentialsPath, removed, nil); err != nil {
 			return err
 		}
 		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
@@ -787,12 +890,17 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		return nil
 	}
 
+	if len(root.Instances) == 0 {
+		// Transitioning from legacy single-instance config: clear root.Config
+		// so instance-specific settings are not promoted to global inherited defaults.
+		root.Config = config.Config{}
+	}
 	root.Instances = kept
 	// Preserve top-level shared settings (log, kernel, etc.) — instances inherit from these.
 	if err := writeRootConfig(defaultConfigPath, root); err != nil {
 		return err
 	}
-	if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
+	if err := pruneCredentialKeys(defaultCredentialsPath, removed, kept); err != nil {
 		return err
 	}
 	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
@@ -829,26 +937,53 @@ func normalizeRootInstances(root *config.RootConfig) []config.Config {
 		return append([]config.Config(nil), root.Instances...)
 	}
 	// Only treat legacy single-config mode if the embedded Config is valid
-	if root.Config.Panel.URL != "" {
+	if root.Config.Panel.URL != "" || root.Config.IsStandalone() {
 		return []config.Config{root.Config}
 	}
 	return nil
 }
 
+func hasWSConfig(ws config.WSConfig) bool {
+	return ws.StatusInterval != 0 || ws.HandshakeTimeout != 0 || ws.BackoffInitial != 0 || ws.BackoffMax != 0 || ws.DiscoveryInterval != 0
+}
+
+func hasCertConfig(c config.CertConfig) bool {
+	return c.CertMode != "" || c.Domain != "" || c.Email != "" ||
+		c.CertFile != "" || c.KeyFile != "" || c.CertDir != "" ||
+		c.CertContent != "" || c.KeyContent != "" ||
+		c.DNSProvider != "" || len(c.DNSEnv) > 0 ||
+		c.HTTPPort != 0 || c.AutoTLS || c.ACMEStorageDir != ""
+}
+
+func hasKernelConfig(k config.KernelConfig) bool {
+	return k.Type != "" || k.LogLevel != "" || k.GeoDataDir != "" ||
+		k.CustomConfig != "" || len(k.CustomRoute) > 0 || len(k.CustomOutbound) > 0
+}
+
 func writeRootConfig(path string, root *config.RootConfig) error {
 	instances := root.Instances
-	if len(instances) == 0 && root.Config.Panel.URL != "" {
+	if len(instances) == 0 && (root.Config.Panel.URL != "" || root.Config.IsStandalone()) {
 		instances = []config.Config{root.Config}
 	}
-	out := fileRootConfig{Instances: make([]fileInstance, 0, len(instances))}
+	out := fileRootConfig{
+		HealthPort: root.Config.HealthPort,
+		Instances:  make([]fileInstance, 0, len(instances)),
+	}
 
 	// Preserve top-level shared settings so instances can inherit them.
 	p := &root.Config
 	if p.Log.Level != "" || p.Log.Output != "" {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
-		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
+	if hasKernelConfig(p.Kernel) {
+		out.Kernel = &fileKernelConfig{
+			Type:         p.Kernel.Type,
+			LogLevel:     p.Kernel.LogLevel,
+			GeoDataDir:   p.Kernel.GeoDataDir,
+			CustomConfig: p.Kernel.CustomConfig,
+			CustomRoute:  p.Kernel.CustomRoute,
+			CustomOut:    p.Kernel.CustomOutbound,
+		}
 	}
 	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
 		out.Node = &fileNodeConfig{
@@ -861,11 +996,13 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Runtime.GoMemLimit != "" || p.Runtime.GoGCPercent != 0 {
 		out.Runtime = &fileRuntimeConfig{GoMemLimit: p.Runtime.GoMemLimit, GoGCPercent: p.Runtime.GoGCPercent}
 	}
-	if p.WS.StatusInterval != 0 || p.WS.HandshakeTimeout != 0 || p.WS.BackoffInitial != 0 {
-		out.WS = &p.WS
+	if hasWSConfig(p.WS) {
+		wsCopy := p.WS
+		out.WS = &wsCopy
 	}
-	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
-		out.Cert = &p.Cert
+	if hasCertConfig(p.Cert) {
+		certCopy := p.Cert
+		out.Cert = &certCopy
 	}
 
 	for _, inst := range instances {
@@ -873,6 +1010,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 			ID: inst.InstanceID,
 			Panel: filePanelConfig{
 				URL:      inst.Panel.URL,
+				Token:    inst.Panel.Token,
 				TokenEnv: inst.Panel.TokenEnv,
 				NodeID:   inst.Panel.NodeID,
 				NodeType: inst.Panel.NodeType,
@@ -891,8 +1029,9 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				Output: inst.Log.Output,
 			},
 			HealthPort: inst.HealthPort,
+			Standalone: inst.Standalone,
 		}
-		if !inst.IsMachineMode() && (inst.Node.PushInterval != 0 || inst.Node.PullInterval != 0 || inst.Node.TrackInterval != 0 || inst.Node.DeviceReportInterval != 0) {
+		if inst.Node.PushInterval != 0 || inst.Node.PullInterval != 0 || inst.Node.TrackInterval != 0 || inst.Node.DeviceReportInterval != 0 {
 			fi.Node = &fileNodeConfig{
 				PushInterval:         inst.Node.PushInterval,
 				PullInterval:         inst.Node.PullInterval,
@@ -909,16 +1048,19 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 		if inst.IsMachineMode() && inst.Machine != nil {
 			fi.Machine = &fileMachineConfig{
 				MachineID: inst.Machine.MachineID,
+				Token:     inst.Machine.Token,
 				TokenEnv:  inst.Machine.TokenEnv,
 			}
 			fi.Panel.NodeID = 0
 			fi.Panel.NodeType = ""
 		}
-		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
-			fi.Cert = &inst.Cert
+		if hasCertConfig(inst.Cert) {
+			certCopy := inst.Cert
+			fi.Cert = &certCopy
 		}
-		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {
-			fi.WS = &inst.WS
+		if hasWSConfig(inst.WS) {
+			wsCopy := inst.WS
+			fi.WS = &wsCopy
 		}
 		if len(inst.Nodes) > 0 {
 			fi.Nodes = inst.Nodes
@@ -932,7 +1074,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-func pruneCredentialKeys(path string, removed []config.Config) error {
+func pruneCredentialKeys(path string, removed []config.Config, remaining []config.Config) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -940,14 +1082,29 @@ func pruneCredentialKeys(path string, removed []config.Config) error {
 		}
 		return fmt.Errorf("read credentials: %w", err)
 	}
-	removeKeys := map[string]struct{}{}
-	for _, inst := range removed {
+	stillUsed := map[string]struct{}{}
+	for _, inst := range remaining {
 		if env := strings.TrimSpace(inst.Panel.TokenEnv); env != "" {
-			removeKeys[env] = struct{}{}
+			stillUsed[env] = struct{}{}
 		}
 		if inst.Machine != nil {
 			if env := strings.TrimSpace(inst.Machine.TokenEnv); env != "" {
+				stillUsed[env] = struct{}{}
+			}
+		}
+	}
+	removeKeys := map[string]struct{}{}
+	for _, inst := range removed {
+		if env := strings.TrimSpace(inst.Panel.TokenEnv); env != "" {
+			if _, keep := stillUsed[env]; !keep {
 				removeKeys[env] = struct{}{}
+			}
+		}
+		if inst.Machine != nil {
+			if env := strings.TrimSpace(inst.Machine.TokenEnv); env != "" {
+				if _, keep := stillUsed[env]; !keep {
+					removeKeys[env] = struct{}{}
+				}
 			}
 		}
 	}
@@ -1020,27 +1177,31 @@ func collectRowsFromMeta() ([]instanceRow, error) {
 }
 
 func collectRowsFromConfig() ([]instanceRow, error) {
-	root, err := config.LoadRoot(defaultConfigPath)
+	root, err := loadWritableRootConfig(defaultConfigPath)
 	if err != nil {
 		return nil, err
 	}
-	instances, err := root.NormalizeInstances()
-	if err != nil {
-		return nil, err
-	}
+	instances := normalizeRootInstances(root)
 	serviceStatus := systemctlState()
 	healthStatus := healthStatus()
 	rows := make([]instanceRow, 0, len(instances))
 	for _, inst := range instances {
-		mode := "node"
-		if inst.IsMachineMode() {
-			mode = "machine"
+		id := inst.InstanceID
+		if id == "" {
+			if autoID, err := inst.AutoInstanceID(); err == nil {
+				id = autoID
+			}
 		}
+		mode := instanceMode(inst)
+		if inst.IsStandalone() {
+			mode = "standalone"
+		}
+		instCopy := inst
 		rows = append(rows, instanceRow{
-			ID:      inst.InstanceID,
+			ID:      id,
 			Mode:    mode,
 			Panel:   inst.Panel.URL,
-			Target:  formatTarget(intPtr(inst.Panel.NodeID), machineIDPtr(inst)),
+			Target:  formatTarget(intPtr(inst.Panel.NodeID), machineIDPtr(&instCopy)),
 			Service: serviceStatus,
 			Health:  healthStatus,
 		})
@@ -1094,33 +1255,20 @@ func healthStatus() string {
 }
 
 func instanceAwareHealth() string {
+	// Match xboard-node & runConfigHealthPort: when instances are configured,
+	// only instances[0].HealthPort is served; otherwise fall back to top-level HealthPort.
 	port := 0
-	if meta, err := loadInstallMeta(defaultMetaPath); err == nil {
-		for _, inst := range meta.Instances {
-			if inst.HealthPort > 0 {
-				port = inst.HealthPort
-				break
-			}
+	if root, err := loadWritableRootConfig(defaultConfigPath); err == nil {
+		instances := normalizeRootInstances(root)
+		if len(instances) > 0 {
+			port = instances[0].HealthPort
+		} else {
+			port = root.HealthPort
 		}
+	} else if meta, err := loadInstallMeta(defaultMetaPath); err == nil && len(meta.Instances) > 0 {
+		port = meta.Instances[0].HealthPort
 	}
-	if port == 0 {
-		if root, err := loadWritableRootConfig(defaultConfigPath); err == nil {
-			// Check top-level health_port first (inherited by all instances)
-			if root.HealthPort > 0 {
-				port = root.HealthPort
-			}
-			if port == 0 {
-				instances, _ := root.NormalizeInstances()
-				for _, inst := range instances {
-					if inst.HealthPort > 0 {
-						port = inst.HealthPort
-						break
-					}
-				}
-			}
-		}
-	}
-	if port == 0 {
+	if port <= 0 {
 		return "disabled"
 	}
 	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
@@ -1241,77 +1389,145 @@ func runConfigInit(args []string) error {
 	)
 
 	for i := 0; i < len(args); i++ {
-		if i+1 >= len(args) {
-			break
+		flagName := args[i]
+		var val string
+		hasInline := false
+		if eq := strings.IndexByte(flagName, '='); eq >= 0 {
+			val = flagName[eq+1:]
+			flagName = flagName[:eq]
+			hasInline = true
 		}
-		switch args[i] {
+		nextVal := func() (string, error) {
+			if hasInline {
+				return val, nil
+			}
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("missing value for flag %s", flagName)
+			}
+			i++
+			return args[i], nil
+		}
+		switch flagName {
 		case "--config":
-			i++
-			configIn = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			configIn = v
 		case "--output":
-			i++
-			configOut = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			configOut = v
 		case "--credentials-in":
-			i++
-			credentialsIn = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			credentialsIn = v
 		case "--credentials-out":
-			i++
-			credentialsOut = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			credentialsOut = v
 		case "--meta":
-			i++
-			metaPath = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			metaPath = v
 		case "--mode":
-			i++
-			mode = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			mode = v
 		case "--panel-url":
-			i++
-			panelURL = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			panelURL = v
 		case "--node-id":
-			i++
-			v, err := strconv.Atoi(args[i])
+			raw, err := nextVal()
+			if err != nil {
+				return err
+			}
+			v, err := strconv.Atoi(raw)
 			if err != nil {
 				return fmt.Errorf("invalid --node-id: %w", err)
 			}
 			nodeID = v
 		case "--node-type":
-			i++
-			nodeType = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			nodeType = v
 		case "--machine-id":
-			i++
-			v, err := strconv.Atoi(args[i])
+			raw, err := nextVal()
+			if err != nil {
+				return err
+			}
+			v, err := strconv.Atoi(raw)
 			if err != nil {
 				return fmt.Errorf("invalid --machine-id: %w", err)
 			}
 			machineID = v
 		case "--kernel":
-			i++
-			kernelType = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			kernelType = v
 		case "--health-port":
-			i++
-			v, err := strconv.Atoi(args[i])
+			raw, err := nextVal()
+			if err != nil {
+				return err
+			}
+			v, err := strconv.Atoi(raw)
 			if err != nil {
 				return fmt.Errorf("invalid --health-port: %w", err)
 			}
 			healthPort = v
 		case "--gomemlimit":
-			i++
-			gomemlimit = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			gomemlimit = v
 		case "--gogc":
-			i++
-			v, err := strconv.Atoi(args[i])
+			raw, err := nextVal()
+			if err != nil {
+				return err
+			}
+			v, err := strconv.Atoi(raw)
 			if err != nil {
 				return fmt.Errorf("invalid --gogc: %w", err)
 			}
 			gogc = v
 		case "--install-root":
-			i++
-			installRoot = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			installRoot = v
 		case "--token":
-			i++
-			token = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			token = v
 		case "--version":
-			i++
-			releaseVersion = args[i]
+			v, err := nextVal()
+			if err != nil {
+				return err
+			}
+			releaseVersion = v
+		default:
+			return fmt.Errorf("unknown flag: %s", flagName)
 		}
 	}
 
@@ -1319,6 +1535,8 @@ func runConfigInit(args []string) error {
 	if strings.ContainsAny(token, "\r\n\x00") {
 		return errors.New("credential value contains a newline or NUL")
 	}
+	token = strings.TrimSpace(token)
+	panelURL = strings.TrimSpace(panelURL)
 	if mode == "" {
 		return errors.New("--mode is required (node or machine)")
 	}
@@ -1330,6 +1548,14 @@ func runConfigInit(args []string) error {
 	}
 	if mode == "machine" && machineID <= 0 {
 		return errors.New("--machine-id is required for machine mode")
+	}
+
+	kt := strings.ToLower(strings.TrimSpace(kernelType))
+	switch kt {
+	case "xray", "xray-core":
+		kernelType = "xray"
+	default:
+		kernelType = "singbox"
 	}
 
 	// Build the new instance.
@@ -1365,7 +1591,7 @@ func runConfigInit(args []string) error {
 	inst.Kernel.ConfigDir = filepath.Join(installRoot, "instances", instanceID)
 
 	// Build credential env key.
-	envKey := "INSTANCE_" + strings.ToUpper(strings.ReplaceAll(instanceID, "-", "_"))
+	envKey := "INSTANCE_" + sanitizeEnvKey(instanceID)
 	if mode == "machine" {
 		envKey += "_MACHINE_TOKEN"
 		inst.Machine.TokenEnv = envKey
@@ -1381,13 +1607,21 @@ func runConfigInit(args []string) error {
 		inst.Runtime.GoGCPercent = gogc
 	}
 
-	// Load existing config (if any).
+	// Load existing config (if any). Fail on parse/IO errors instead of
+	// silently overwriting an existing config.yml and destroying prior instances.
 	root := &config.RootConfig{}
 	hasExisting := false
+	wasLegacySingle := false
 	if configIn != "" {
-		if loaded, loadErr := loadWritableRootConfig(configIn); loadErr == nil {
+		loaded, loadErr := loadWritableRootConfig(configIn)
+		if loadErr != nil {
+			if !errors.Is(loadErr, os.ErrNotExist) {
+				return fmt.Errorf("load existing config %s: %w", configIn, loadErr)
+			}
+		} else {
 			root = loaded
-			hasExisting = len(root.Instances) > 0 || root.Config.Panel.URL != "" || root.Config.Kernel.Type != ""
+			wasLegacySingle = len(root.Instances) == 0 && (root.Config.Panel.URL != "" || root.Config.IsStandalone())
+			hasExisting = len(root.Instances) > 0 || wasLegacySingle
 		}
 	}
 
@@ -1395,6 +1629,11 @@ func runConfigInit(args []string) error {
 	var instances []config.Config
 	if hasExisting {
 		instances = normalizeRootInstances(root)
+		if wasLegacySingle {
+			// Clear root.Config after moving legacy single-instance settings into
+			// instances[0] so they don't leak into top-level inherited defaults.
+			root.Config = config.Config{}
+		}
 		seen := make(map[string]bool)
 		deduped := make([]config.Config, 0, len(instances))
 		for _, existing := range instances {
@@ -1424,6 +1663,17 @@ func runConfigInit(args []string) error {
 		}
 	}
 	if !replaced {
+		// xboard-node serves /healthz on instances[0].HealthPort and ValidateStartupLayout
+		// rejects duplicate health_port values across instances. Clear conflicting
+		// health_port when appending a subsequent instance.
+		if inst.HealthPort > 0 && len(instances) > 0 {
+			for _, existing := range instances {
+				if existing.HealthPort == inst.HealthPort || existing.HealthPort > 0 {
+					inst.HealthPort = 0
+					break
+				}
+			}
+		}
 		instances = append(instances, inst)
 	}
 	root.Instances = instances
@@ -1469,9 +1719,13 @@ func mergeCredentials(srcPath, dstPath, key, value string) error {
 	var order []string
 	if srcPath != "" {
 		data, err := os.ReadFile(srcPath)
-		if err == nil {
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("read credentials %s: %w", srcPath, err)
+			}
+		} else {
 			for _, raw := range strings.Split(string(data), "\n") {
-				line := strings.TrimSpace(raw)
+				line := strings.TrimSuffix(raw, "\r")
 				if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
 					continue
 				}
@@ -1504,14 +1758,13 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 	}
 	instances := normalizeRootInstances(root)
 	items := make([]instanceSummary, 0, len(instances))
+	autoLatest := ""
 	for _, inst := range instances {
 		id, err := inst.AutoInstanceID()
 		if err != nil {
 			return err
 		}
-		if latestID == "" {
-			latestID = id
-		}
+		autoLatest = id
 		item := instanceSummary{
 			ID:         id,
 			PanelURL:   inst.Panel.URL,
@@ -1524,6 +1777,9 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 			item.NodeID = nil
 		}
 		items = append(items, item)
+	}
+	if latestID == "" {
+		latestID = autoLatest
 	}
 	meta := installMeta{
 		ConfigMode:       "instances",
@@ -1545,7 +1801,11 @@ func writeInstallMetaVersioned(path string, root *config.RootConfig, ver, latest
 func runConfigHealthPort(args []string) error {
 	cfgPath := defaultConfigPath
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--config" && i+1 < len(args) {
+		if strings.HasPrefix(args[i], "--config=") {
+			cfgPath = strings.TrimPrefix(args[i], "--config=")
+		} else if strings.HasPrefix(args[i], "-c=") {
+			cfgPath = strings.TrimPrefix(args[i], "-c=")
+		} else if (args[i] == "--config" || args[i] == "-c") && i+1 < len(args) {
 			i++
 			cfgPath = args[i]
 		}
@@ -1565,4 +1825,18 @@ func runConfigHealthPort(args []string) error {
 		fmt.Println(root.Config.HealthPort)
 	}
 	return nil
+}
+
+// sanitizeEnvKey ensures the string contains only alphanumeric characters and underscores,
+// converting all other runes (e.g. hyphens, commas, colons) to underscores.
+func sanitizeEnvKey(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(unicode.ToUpper(r))
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
 }

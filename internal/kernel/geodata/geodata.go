@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -18,7 +20,15 @@ const (
 	xrayGeoSiteURL    = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 )
 
-var httpClient = &http.Client{Timeout: 10 * time.Minute}
+var (
+	httpClient = &http.Client{Timeout: 10 * time.Minute}
+	fileLocks  sync.Map // dst path -> *sync.Mutex
+)
+
+func lockForFile(dst string) *sync.Mutex {
+	v, _ := fileLocks.LoadOrStore(filepath.Clean(dst), &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 func Ensure(dir string, needGeoIP, needGeoSite bool, kernelType string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -31,7 +41,8 @@ func Ensure(dir string, needGeoIP, needGeoSite bool, kernelType string) error {
 	}
 
 	var files []entry
-	if kernelType == "singbox" {
+	kt := strings.ToLower(strings.TrimSpace(kernelType))
+	if kt == "singbox" || kt == "sing-box" {
 		if needGeoIP {
 			files = append(files, entry{"geoip.db", singboxGeoIPURL})
 		}
@@ -64,6 +75,12 @@ func ensureFile(dir, name, url string) error {
 	if _, err := os.Stat(dst); err == nil {
 		return nil
 	}
+	mu := lockForFile(dst)
+	mu.Lock()
+	defer mu.Unlock()
+	if _, err := os.Stat(dst); err == nil {
+		return nil
+	}
 	nlog.Core().Info("geo database missing, downloading automatically", "file", name, "url", url)
 	if err := atomicDownload(dst, url); err != nil {
 		return err
@@ -85,11 +102,11 @@ func atomicDownload(dst, url string) error {
 		return fmt.Errorf("unexpected HTTP status from %s: %s", url, resp.Status)
 	}
 
-	tmp := dst + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
+	tmp := f.Name()
 	defer os.Remove(tmp)
 
 	if _, err := io.Copy(f, resp.Body); err != nil {
@@ -99,6 +116,7 @@ func atomicDownload(dst, url string) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
+	_ = os.Remove(dst)
 	if err := os.Rename(tmp, dst); err != nil {
 		return fmt.Errorf("rename to destination: %w", err)
 	}

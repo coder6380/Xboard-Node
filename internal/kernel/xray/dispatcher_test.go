@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -109,18 +110,12 @@ func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 	ld.UpdateLimits(map[string]int{email1: 1, email2: 2}, nil, nil)
 
 	ic1 := &ipCounter{}
-	r1 := &atomic.Int64{}
-	r1.Store(1)
-	ic1.ips.Store("1.1.1.1", r1)
-	r2 := &atomic.Int64{}
-	r2.Store(1)
-	ic1.ips.Store("2.2.2.2", r2)
+	ic1.add("1.1.1.1")
+	ic1.add("2.2.2.2")
 	ld.unlimitedIPs.Store(email1, ic1)
 
 	ic2 := &ipCounter{}
-	r3 := &atomic.Int64{}
-	r3.Store(1)
-	ic2.ips.Store("3.3.3.3", r3)
+	ic2.add("3.3.3.3")
 	ld.unlimitedIPs.Store(email2, ic2)
 
 	ld.connCount.Store(5)
@@ -275,5 +270,99 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
 		t.Fatal("device slot should be released after writer close")
+	}
+}
+
+func TestLimitDispatcher_UnlimitedToLimitedTransitionNoLeak(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(10)
+	ld.UpdateLimits(map[string]int{email: 10}, nil, nil)
+
+	// Connect while unlimited
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("unlimited user should be allowed")
+	}
+
+	// Transition user to device_limit=1
+	ld.UpdateLimits(map[string]int{email: 10}, map[string]int{email: 1}, nil)
+
+	// Open a limited connection from a second IP and close it
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Fatal("first limited IP should be allowed")
+	}
+	ld.delConn(email, "2.2.2.2")
+
+	// Slot must be released (not leaked by stale unlimitedIPs entry)
+	if ld.checkDeviceLimit(email, "3.3.3.3", true) {
+		t.Fatal("device slot leaked after unlimited->limited transition")
+	}
+	ld.delConn(email, "3.3.3.3")
+	ld.delConn(email, "1.1.1.1")
+
+	alive, _ := ld.GetConnectionState()
+	if len(alive[10]) != 0 {
+		t.Fatalf("expected no remaining alive IPs, got %v", alive[10])
+	}
+}
+
+func TestLimitDispatcher_ConcurrentGetConnectionState(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(42)
+	ld.UpdateLimits(map[string]int{email: 42}, map[string]int{email: 5}, nil)
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ip := "10.0.0." + string(rune('1'+id%5))
+			for i := 0; i < 200; i++ {
+				if !ld.checkDeviceLimit(email, ip, true) {
+					ld.delConn(email, ip)
+				}
+			}
+		}(g)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_, _ = ld.GetConnectionState()
+		}
+	}()
+	wg.Wait()
+}
+
+func TestLimitDispatcher_ConcurrentDeviceLimitStrictEnforcement(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(99)
+	ld.UpdateLimits(map[string]int{email: 99}, map[string]int{email: 2}, nil)
+
+	// Occupy both slots with lowest IPs, then hammer with higher IPs concurrently.
+	if ld.checkDeviceLimit(email, "10.0.0.1", true) {
+		t.Fatal("slot 1 should be allowed")
+	}
+	if ld.checkDeviceLimit(email, "10.0.0.2", true) {
+		t.Fatal("slot 2 should be allowed")
+	}
+
+	var wg sync.WaitGroup
+	var bypassed atomic.Int32
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ip := "10.0.0." + string(rune('3'+id%7))
+			for i := 0; i < 100; i++ {
+				if !ld.checkDeviceLimit(email, ip, true) {
+					bypassed.Add(1)
+					ld.delConn(email, ip)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	if bypassed.Load() != 0 {
+		t.Fatalf("device limit bypassed %d times under concurrency", bypassed.Load())
 	}
 }

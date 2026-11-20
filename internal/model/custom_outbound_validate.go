@@ -32,7 +32,7 @@ func ValidateCustomOutboundsForKernel(outbounds []OutboundConfig, kernelType str
 	availableTags["direct"] = struct{}{}
 	availableTags["block"] = struct{}{}
 	for _, tag := range additionalTags {
-		tag = strings.ToLower(strings.TrimSpace(tag))
+		tag = strings.TrimSpace(tag)
 		if tag != "" {
 			availableTags[tag] = struct{}{}
 		}
@@ -60,18 +60,18 @@ func ValidateCustomOutboundsForKernel(outbounds []OutboundConfig, kernelType str
 			return fmt.Errorf("custom_outbounds[%d].tag duplicates %q", i, tag)
 		}
 		seen[key] = struct{}{}
-		availableTags[key] = struct{}{}
+		availableTags[tag] = struct{}{}
 	}
 
 	for i, outbound := range outbounds {
 		if outbound.ProxyTag == "" {
 			continue
 		}
-		proxyTag := strings.ToLower(strings.TrimSpace(outbound.ProxyTag))
+		proxyTag := strings.TrimSpace(outbound.ProxyTag)
 		if proxyTag == "" {
 			return fmt.Errorf("custom_outbounds[%d].proxy_tag must not be blank", i)
 		}
-		if proxyTag == strings.ToLower(strings.TrimSpace(outbound.Tag)) {
+		if proxyTag == strings.TrimSpace(outbound.Tag) {
 			return fmt.Errorf("custom_outbounds[%d].proxy_tag must not reference itself", i)
 		}
 		if _, exists := availableTags[proxyTag]; !exists {

@@ -170,11 +170,12 @@ type WSClient struct {
 
 	cfg WSClientConfig
 
-	connected atomic.Bool
+	connected          atomic.Bool
+	notifiedDisconnect atomic.Bool
 
 	// writeCh allows sending messages from outside the connect loop.
-	// It is set in connect() and cleared on disconnect.
-	writeCh chan wsMessage
+	// Stored atomically so concurrent senders never race with reconnects.
+	writeCh atomic.Pointer[chan wsMessage]
 }
 
 // NewWSClient creates a new WebSocket client.
@@ -208,6 +209,11 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 func (w *WSClient) IsConnected() bool { return w.connected.Load() }
 
 func (w *WSClient) notifyStatus(connected bool) {
+	if connected {
+		w.notifiedDisconnect.Store(false)
+	} else if !w.notifiedDisconnect.CompareAndSwap(false, true) {
+		return
+	}
 	if w.onStatus != nil {
 		w.onStatus(WSStatusChange{Connected: connected})
 	}
@@ -221,6 +227,9 @@ func (w *WSClient) Run(ctx context.Context) {
 		err := w.connect(ctx)
 
 		wasConnected := w.connected.Swap(false)
+		if ctx.Err() != nil {
+			return
+		}
 		if wasConnected {
 			w.notifyStatus(false)
 		}
@@ -232,19 +241,16 @@ func (w *WSClient) Run(ctx context.Context) {
 			}
 		}
 
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		// Reset backoff if the connection was up for a meaningful duration.
 		if time.Since(start) > 2*time.Minute {
 			backoff = w.cfg.BackoffInitial
 		}
 
 		// Apply exponential backoff with jitter to prevent thundering herd.
-		jitter := time.Duration(rand.Int63n(int64(backoff / 5)))
+		var jitter time.Duration
+		if maxJitter := int64(backoff / 5); maxJitter > 0 {
+			jitter = time.Duration(rand.Int63n(maxJitter))
+		}
 		wait := backoff + jitter
 
 		timer := time.NewTimer(wait)
@@ -324,15 +330,29 @@ func (w *WSClient) connect(ctx context.Context) error {
 		w.notifyStatus(true)
 	}
 
-	// Ping interval: send pong responses to server pings.
-	// We also use this timer to trigger periodic status pushes.
+	// Establish rolling read deadline so silent network drops (NAT/firewall idle
+	// drops without TCP FIN/RST) cannot hang ReadJSON forever, especially in
+	// machine mode where onPing is nil. Floor at 90s so panels/proxies that only
+	// send 60s application-level JSON pings (without RFC6455 Pong) never falsely drop.
+	readTimeout := w.cfg.StatusInterval * 6
+	if readTimeout < 90*time.Second {
+		readTimeout = 90 * time.Second
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		return fmt.Errorf("set rolling read deadline: %w", err)
+	}
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(readTimeout))
+	})
+
+	// Ping interval: send WS keepalive pings and periodic status pushes.
 	reportTicker := time.NewTicker(w.cfg.StatusInterval)
 	defer reportTicker.Stop()
 
 	// writeCh decouples data collection from network I/O.
 	writeCh := make(chan wsMessage, 16)
-	w.writeCh = writeCh
-	defer func() { w.writeCh = nil }()
+	w.writeCh.Store(&writeCh)
+	defer func() { w.writeCh.Store(nil) }()
 
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -347,6 +367,7 @@ func (w *WSClient) connect(ctx context.Context) error {
 				}
 				return
 			}
+			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 			nlog.Core().Debug("ws recv", "event", msg.Event, "data", string(msg.Data))
 			w.handleMessage(msg)
 			if msg.Event == "ping" {
@@ -358,19 +379,28 @@ func (w *WSClient) connect(ctx context.Context) error {
 			}
 		}
 	}()
+	// Ensure the read goroutine has exited on ALL return paths (including
+	// WriteJSON / Ping errors) before connect() returns, preventing stale
+	// onEvent callbacks from racing with subsequent disconnect/reconnect state.
+	defer func() {
+		conn.Close()
+		<-done
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			// 先关闭连接，再等待读取协程，避免对端不响应关闭帧导致死锁。
-			conn.Close()
-			<-done
 			return nil
 
 		case err := <-errCh:
 			return fmt.Errorf("read: %w", err)
 
 		case <-reportTicker.C:
+			// Send WS protocol-level Ping to detect silent half-open drops.
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return fmt.Errorf("ping: %w", err)
+			}
 			// Send periodic node.status via WebSocket
 			if w.onPing != nil {
 				msg := wsMessage{Event: "node.status"}
@@ -556,11 +586,7 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 		Timestamp: time.Now().Unix(),
 	}
 
-	select {
-	case w.writeCh <- msg:
-	default:
-		nlog.Core().Warn("ws write channel full, skipping device report")
-	}
+	w.tryWrite(msg, "ws write channel full, skipping device report")
 }
 
 // SendNodeStatus sends a node.status event with the given node_id (machine mode).
@@ -577,11 +603,7 @@ func (w *WSClient) SendNodeStatus(nodeID int, stats map[string]interface{}) {
 		Data:      data,
 		Timestamp: time.Now().Unix(),
 	}
-	select {
-	case w.writeCh <- msg:
-	default:
-		nlog.Core().Warn("ws write channel full, skipping node status")
-	}
+	w.tryWrite(msg, "ws write channel full, skipping node status")
 }
 
 // SendRaw sends a raw message to the panel via WebSocket.
@@ -596,9 +618,17 @@ func (w *WSClient) SendRaw(event string, data json.RawMessage) {
 		Timestamp: time.Now().Unix(),
 	}
 
+	w.tryWrite(msg, "ws write channel full, skipping raw message", "event", event)
+}
+
+func (w *WSClient) tryWrite(msg wsMessage, warnMsg string, args ...any) {
+	chPtr := w.writeCh.Load()
+	if chPtr == nil {
+		return
+	}
 	select {
-	case w.writeCh <- msg:
+	case *chPtr <- msg:
 	default:
-		nlog.Core().Warn("ws write channel full, skipping raw message", "event", event)
+		nlog.Core().Warn(warnMsg, args...)
 	}
 }

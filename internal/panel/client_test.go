@@ -349,3 +349,22 @@ func TestStringOrArrayDecodeHook_String(t *testing.T) {
 		t.Errorf("got %q, want %q", cfg.PaddingScheme, want)
 	}
 }
+
+func TestCertConfigModeFallbackInDecodeWeakRaw(t *testing.T) {
+	input := map[string]interface{}{
+		"protocol":    "vless",
+		"server_port": 443,
+		"cert_config": map[string]interface{}{
+			"mode":         "dns",
+			"domain":       "node.example.com",
+			"dns_provider": "cloudflare",
+		},
+	}
+	var cfg NodeConfig
+	if err := decodeWeakRaw(input, &cfg); err != nil {
+		t.Fatalf("decodeWeakRaw failed: %v", err)
+	}
+	if cfg.CertConfig == nil || cfg.CertConfig.CertMode != "dns" {
+		t.Fatalf("expected CertMode=dns from mode fallback, got %+v", cfg.CertConfig)
+	}
+}

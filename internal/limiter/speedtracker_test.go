@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
+	"golang.org/x/time/rate"
 )
 
 func TestSpeedTracker_UpdateBuckets(t *testing.T) {
@@ -143,5 +144,55 @@ func TestSpeedTracker_UpdateBuckets_LogCallbackMayCallLimitedUserCount(t *testin
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("deadlock: UpdateBuckets did not finish (log callback vs RWMutex)")
+	}
+}
+
+func TestSpeedTracker_HasLimitsAndUnthrottlesExistingConnections(t *testing.T) {
+	l := New()
+	st := NewSpeedTracker(l)
+
+	// User has speed limit configured, but has not connected yet (no bucket created).
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 10}})
+	st.UpdateBuckets()
+	if !st.HasLimits() {
+		t.Fatal("HasLimits() = false, want true when limited users exist before any connection")
+	}
+
+	// Active connection acquires limiter handle.
+	lim := st.GetLimiter("u1")
+	if lim == nil {
+		t.Fatal("expected non-nil limiter for u1")
+	}
+
+	// Admin lifts speed limit to 0 (unlimited): existing limiter must become rate.Inf
+	// so active connections are immediately unthrottled, and HasLimits() becomes false.
+	l.UpdateUsers([]model.UserSpec{{ID: 1, UUID: "u1", SpeedLimit: 0}})
+	st.UpdateBuckets()
+	if st.HasLimits() {
+		t.Fatal("HasLimits() = true, want false after all speed limits removed")
+	}
+	if lim.Limit() != rate.Inf {
+		t.Fatalf("existing limiter Limit() = %v, want rate.Inf after clearing speed limit", lim.Limit())
+	}
+	if st.GetLimiter("u1") != nil {
+		t.Fatal("expected nil limiter after speed limit cleared")
+	}
+}
+
+func TestSpeedLimitLargeMbpsNoOverflow(t *testing.T) {
+	limit, burst := speedLimitToBytesAndBurst(100_000) // 100,000 Mbps = 100 Gbps
+	if limit <= 0 {
+		t.Fatalf("expected positive limit, got %v", limit)
+	}
+	if burst <= 0 {
+		t.Fatalf("expected positive burst, got %v", burst)
+	}
+	expectedBps := int64(100_000) * 1_000_000 / 8
+	if int64(limit) != expectedBps {
+		t.Fatalf("limit = %v, want %v", limit, expectedBps)
+	}
+	expectedBurst := expectedBps
+	if int64(burst) != expectedBurst {
+		t.Fatalf("burst = %v, want %v", burst, expectedBurst)
 	}
 }

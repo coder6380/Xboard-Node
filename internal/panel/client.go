@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,10 +37,12 @@ type Client struct {
 	machineID  int
 	httpClient *http.Client
 
-	// etagMu 串行化请求和缓存失效，避免在失效之后写回过期 ETag。
-	etagMu     sync.Mutex
-	configETag string
-	userETag   string
+	// etagMu 仅短时保护 ETag 及代际号，绝不跨越网络 I/O 持锁。
+	etagMu        sync.Mutex
+	configETag    string
+	userETag      string
+	configETagGen uint64
+	userETagGen   uint64
 
 	apiSuccess atomic.Uint64
 	apiFailure atomic.Uint64
@@ -84,11 +87,17 @@ func (c *Client) ResetConfigETag() {
 	c.etagMu.Lock()
 	defer c.etagMu.Unlock()
 	c.configETag = ""
+	c.configETagGen++
 }
 
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
 func (c *Client) Handshake() (*HandshakeResponse, error) {
-	resp, err := c.doRequest("POST", "/api/v2/server/handshake", nil, "")
+	return c.HandshakeContext(context.Background())
+}
+
+// HandshakeContext calls the v2 handshake API honoring ctx cancellation.
+func (c *Client) HandshakeContext(ctx context.Context) (*HandshakeResponse, error) {
+	resp, err := c.doRequestContext(ctx, "POST", "/api/v2/server/handshake", nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
@@ -193,6 +202,21 @@ func decodeWeakRaw(input map[string]interface{}, output interface{}) error {
 					}
 					return StringOrArray(strings.Join(strs, "\n")), nil
 				}
+				// Support CertConfig "mode" fallback field (mapstructure does not invoke UnmarshalJSON).
+				if t == reflect.TypeOf(CertConfig{}) {
+					if m, ok := v.(map[string]interface{}); ok {
+						cm, _ := m["cert_mode"].(string)
+						mode, _ := m["mode"].(string)
+						if cm == "" && mode != "" {
+							cp := make(map[string]interface{}, len(m)+1)
+							for k, val := range m {
+								cp[k] = val
+							}
+							cp["cert_mode"] = mode
+							return cp, nil
+						}
+					}
+				}
 				return v, nil
 			},
 			mapstructure.StringToSliceHookFunc(","),
@@ -221,9 +245,18 @@ func (c *Client) userPath() string {
 
 // GetConfig fetches node configuration. Returns nil if not modified (304).
 func (c *Client) GetConfig() (*NodeConfig, error) {
+	return c.GetConfigContext(context.Background())
+}
+
+// GetConfigContext fetches node configuration honoring ctx cancellation.
+// Returns nil if not modified (304).
+func (c *Client) GetConfigContext(ctx context.Context) (*NodeConfig, error) {
 	c.etagMu.Lock()
-	defer c.etagMu.Unlock()
-	resp, err := c.doRequest("GET", c.configPath(), nil, c.configETag)
+	etag := c.configETag
+	gen := c.configETagGen
+	c.etagMu.Unlock()
+
+	resp, err := c.doRequestContext(ctx, "GET", c.configPath(), nil, etag)
 	if err != nil {
 		return nil, fmt.Errorf("get config: %w", err)
 	}
@@ -253,17 +286,30 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		return nil, fmt.Errorf("invalid config: missing protocol")
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.configETag = etag
+	if newETag := resp.Header.Get("ETag"); newETag != "" {
+		c.etagMu.Lock()
+		if c.configETagGen == gen {
+			c.configETag = newETag
+		}
+		c.etagMu.Unlock()
 	}
 	return &cfg, nil
 }
 
 // GetUsers fetches available users. Returns nil if not modified (304).
 func (c *Client) GetUsers() ([]User, error) {
+	return c.GetUsersContext(context.Background())
+}
+
+// GetUsersContext fetches available users honoring ctx cancellation.
+// Returns nil if not modified (304).
+func (c *Client) GetUsersContext(ctx context.Context) ([]User, error) {
 	c.etagMu.Lock()
-	defer c.etagMu.Unlock()
-	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
+	etag := c.userETag
+	gen := c.userETagGen
+	c.etagMu.Unlock()
+
+	resp, err := c.doRequestContext(ctx, "GET", c.userPath(), nil, etag)
 	if err != nil {
 		return nil, fmt.Errorf("get users: %w", err)
 	}
@@ -282,8 +328,12 @@ func (c *Client) GetUsers() ([]User, error) {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.userETag = etag
+	if newETag := resp.Header.Get("ETag"); newETag != "" {
+		c.etagMu.Lock()
+		if c.userETagGen == gen {
+			c.userETag = newETag
+		}
+		c.etagMu.Unlock()
 	}
 	return usersResp.Users, nil
 }
@@ -329,6 +379,8 @@ func (c *Client) ResetETags() {
 	defer c.etagMu.Unlock()
 	c.configETag = ""
 	c.userETag = ""
+	c.configETagGen++
+	c.userETagGen++
 }
 
 // GetMachineNodes fetches the list of active nodes bound to this machine.
@@ -419,11 +471,17 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
 	}
-	c.apiSuccess.Add(1)
 	return nil
 }
 
 func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
+	return c.doRequestContext(context.Background(), method, path, body, ifNoneMatch)
+}
+
+func (c *Client) doRequestContext(ctx context.Context, method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fullURL := c.baseURL + path
 
 	var bodyReader io.Reader
@@ -438,7 +496,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 		bodyReader = bytes.NewReader(merged)
 	}
 
-	req, err := http.NewRequest(method, fullURL, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, err
 	}

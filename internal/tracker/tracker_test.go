@@ -230,3 +230,47 @@ func TestTrafficAccumulation(t *testing.T) {
 		t.Errorf("accumulated: got %v, want [350,600]", flushed[1])
 	}
 }
+
+func TestRestoreAliveIPsAndIndependentDeviceReport(t *testing.T) {
+	tr := New()
+	tr.Process(map[int][2]int64{1: {100, 200}}, map[int]map[string]bool{
+		1: {"1.1.1.1": true},
+	}, 1)
+
+	// Device report flush must NOT suppress HTTP report FlushAliveIPs.
+	dev := tr.FlushDeviceReport()
+	if len(dev[1]) != 1 || dev[1][0] != "1.1.1.1" {
+		t.Fatalf("unexpected device report: %v", dev)
+	}
+	alive := tr.FlushAliveIPs()
+	if len(alive[1]) != 1 || alive[1][0] != "1.1.1.1" {
+		t.Fatalf("FlushAliveIPs should be independent of FlushDeviceReport, got %v", alive)
+	}
+
+	// Simulate failed HTTP report -> RestoreAliveIPs must cause next FlushAliveIPs to re-emit.
+	tr.RestoreAliveIPs(alive)
+	retried := tr.FlushAliveIPs()
+	if len(retried[1]) != 1 || retried[1][0] != "1.1.1.1" {
+		t.Fatalf("expected restored alive IPs on retry flush, got %v", retried)
+	}
+
+	// Mutating returned map must not corrupt tracker state.
+	retried[1] = append(retried[1], "9.9.9.9")
+	tr.RestoreAliveIPs(map[int][]string{2: {"2.2.2.2"}})
+	merged := tr.FlushAliveIPs()
+	if len(merged[1]) != 1 || len(merged[2]) != 1 {
+		t.Fatalf("expected clean merged retry snapshot, got %v", merged)
+	}
+}
+
+func TestSpeedUsesConfiguredTrackInterval(t *testing.T) {
+	tr := New()
+	tr.SetTrackInterval(5)
+	tr.Process(map[int][2]int64{1: {500, 1000}}, nil, 1)
+	if got := tr.OutboundSpeed(); got != 100 {
+		t.Fatalf("OutboundSpeed = %d, want 100", got)
+	}
+	if got := tr.InboundSpeed(); got != 200 {
+		t.Fatalf("InboundSpeed = %d, want 200", got)
+	}
+}

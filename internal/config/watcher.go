@@ -57,7 +57,6 @@ func WatchConfig(ctx context.Context, path string, onChange func(*Config)) (*Wat
 	return w, nil
 }
 
-
 // WatchConfigRoot watches path and reloads the root config model.
 func WatchConfigRoot(ctx context.Context, path string, onChange func(*RootConfig)) (*Watcher, error) {
 	absPath, err := filepath.Abs(path)
@@ -92,6 +91,7 @@ func WatchConfigRoot(ctx context.Context, path string, onChange func(*RootConfig
 func (w *Watcher) loop(ctx context.Context) {
 	var timer *time.Timer
 	defer func() {
+		w.stopped.Store(true)
 		if timer != nil {
 			timer.Stop()
 		}
@@ -139,6 +139,15 @@ func (w *Watcher) reload() {
 		root, err := LoadRoot(w.path)
 		if err != nil {
 			nlog.Core().Error("config reload failed, keeping current config", "error", err)
+			return
+		}
+		instances, err := root.NormalizeInstances()
+		if err != nil {
+			nlog.Core().Error("config reload normalize failed, keeping current config", "error", err)
+			return
+		}
+		if err := ValidateStartupLayout(instances); err != nil {
+			nlog.Core().Error("config reload layout validation failed, keeping current config", "error", err)
 			return
 		}
 		nlog.Core().Info("config reloaded successfully")
